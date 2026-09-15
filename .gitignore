@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env*
+!.env.example
+config.local.json
+runtime/
+work/
+outputs/
+PROPOSAL.md
+*.db
+*.sqlite*
+.superpowers/
