@@ -6,11 +6,12 @@ from datetime import date, datetime
 
 from fxbot.config import Settings
 from fxbot.instruments import usd_direction
-from fxbot.strategy import LONDON, Signal
+from fxbot.strategy import LONDON, Signal, require_aware
 
 
 @dataclass(frozen=True)
 class OpenPosition:
+    """risk_gbp is the trade's full planned loss: stop risk + cost risk (spec §6 rule 2)."""
     pair: str
     side: int
     units: int
@@ -58,8 +59,10 @@ def size_units(nav: float, stop_distance: float, cost: float, loss_factor: float
 
 def evaluate(candidate: Candidate, account: AccountState, settings: Settings) -> Decision:
     s, c, a, sig = settings, candidate, account, candidate.signal
-    if a.block_reason:
+    if a.block_reason is not None:
         return Decision(False, a.block_reason)
+    if sig.stop_distance <= 0 or c.loss_factor <= 0 or c.price <= 0:
+        return Decision(False, "invalid price data")
     units = size_units(a.nav, sig.stop_distance, c.cost, c.loss_factor, s.risk_per_trade)
     if units < 1:
         return Decision(False, "position below minimum size")
@@ -91,7 +94,7 @@ def evaluate(candidate: Candidate, account: AccountState, settings: Settings) ->
 
 
 def uk_trading_day(at_utc: datetime) -> date:
-    return at_utc.astimezone(LONDON).date()
+    return require_aware(at_utc).astimezone(LONDON).date()
 
 
 def daily_pnl(start_nav: float, current_nav: float, deposits: float, withdrawals: float) -> float:

@@ -1,7 +1,7 @@
 """15-minute breakout with 1-hour trend filter (spec §3). Pure functions only."""
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from fxbot.config import Settings
@@ -59,6 +59,9 @@ def evaluate(pair: str, h1: Sequence[Candle], m15: Sequence[Candle],
         return None
     h1 = h1[-s.h1_window:]
     m15 = m15[-s.m15_window:]
+    # no lookahead: the H1 candle must have closed by the time the M15 signal candle closes
+    if h1[-1].time + timedelta(hours=1) > m15[-1].time + timedelta(minutes=15):
+        return None
     trend = _trend(h1, s)
     if trend == 0 or _breakout(m15, s.breakout_lookback) != trend:
         return None
@@ -66,8 +69,15 @@ def evaluate(pair: str, h1: Sequence[Candle], m15: Sequence[Candle],
     return Signal(pair, trend, m15[-1].time, s.stop_atr_mult * a)
 
 
+def require_aware(at: datetime) -> datetime:
+    if at.tzinfo is None:
+        raise ValueError("datetime must be timezone-aware (UTC)")
+    return at
+
+
 def entry_window_open(close_time_utc: datetime, settings: Settings) -> bool:
-    local = close_time_utc.astimezone(LONDON)
+    """Takes the signal candle's CLOSE time (Signal.candle_time + 15 minutes)."""
+    local = require_aware(close_time_utc).astimezone(LONDON)
     if local.weekday() >= 5:
         return False
     t = local.time()

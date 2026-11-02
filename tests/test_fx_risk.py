@@ -58,6 +58,21 @@ class ApprovalTests(unittest.TestCase):
         self.assertEqual(d.reason, reason)
         self.assertEqual(d.units, 0)
 
+    def test_accepts_exactly_at_every_cap(self):
+        # binary-exact numbers: units = floor(2.5 / 0.5) = 5, risk 2.5, notional 5, margin 2.5
+        cand = Candidate(Signal("EUR_USD", +1, T, 0.5), 0.0, 1.0, 1.0, 1.0, 0.5, 1000)
+        positions = [OpenPosition("USD_JPY", +1, 1, 5.0, 5000.0),   # long USD
+                     OpenPosition("GBP_USD", +1, 1, 2.5, 4995.0)]   # short USD
+        # open risk 7.5+2.5=10.0, short-USD 2.5+2.5=5.0, notional 9995+5=10000, margin 497.5+2.5=500
+        d = evaluate(cand, account(margin_used=497.5, positions=positions), S)
+        self.assertEqual((d.approved, d.units, d.risk_gbp), (True, 5, 2.5))
+
+    def test_empty_block_reason_still_blocks(self):
+        self.assertFalse(evaluate(candidate(), account(block=""), S).approved)
+
+    def test_invalid_conversion_factor_rejected(self):
+        self.reject(candidate(loss_factor=0.0), account(), "invalid price data")
+
     def test_block_reason_wins(self):
         self.reject(candidate(), account(block="halted: missing stop"), "halted: missing stop")
 

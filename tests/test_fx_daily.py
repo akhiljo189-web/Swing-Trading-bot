@@ -29,6 +29,10 @@ class TradingDayTests(unittest.TestCase):
     def test_uk_date_in_winter(self):
         self.assertEqual(uk_trading_day(datetime(2026, 11, 3, 23, 30, tzinfo=timezone.utc)), date(2026, 11, 3))
 
+    def test_naive_datetime_rejected(self):
+        with self.assertRaises(ValueError):
+            uk_trading_day(datetime(2026, 11, 3, 23, 30))
+
 
 if __name__ == "__main__":
     unittest.main()

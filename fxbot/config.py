@@ -40,3 +40,11 @@ class Settings:
     daily_loss_limit: float = 0.015
     max_margin_fraction: float = 0.5
     max_gross_notional_multiple: float = 10.0
+
+    def __post_init__(self):
+        if self.ema_slow > self.h1_window or self.ema_fast > self.h1_window:
+            raise ValueError("EMA periods must fit inside h1_window")
+        if self.atr_period > self.m15_window:
+            raise ValueError("atr_period must fit inside m15_window")
+        if self.breakout_lookback + 2 > self.m15_window:
+            raise ValueError("breakout_lookback + 2 must fit inside m15_window")

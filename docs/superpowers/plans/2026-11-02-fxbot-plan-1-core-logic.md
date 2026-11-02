@@ -21,6 +21,16 @@
 
 Plans 2–4 are written after Plan 1 is merged, so they build on the real interfaces.
 
+### Carried forward from the Plan 1 code review (must be honoured by later plans)
+- **Plan 2:** call `entry_window_open(signal.candle_time + 15 min)` — it takes the candle *close*
+  time; pass the decision time as `at` to `news_blocked`; assert both in engine tests.
+- **Plan 2:** `OpenPosition.risk_gbp` and post-fill risk recomputation use stop risk + cost risk
+  (spec §6 rule 2), the same basis as new candidates.
+- **Plan 2/3:** P&L direction helpers (spec §4 `instruments.py`) are added where first needed.
+- **Plan 3:** the backtest cost filter must use a documented spread source (bid/ask of the
+  decision candle's close) so live and backtest reject the same trades.
+- **Plan 4:** credentials from environment variables (spec §4 `config.py`).
+
 ## Global Constraints
 
 - Python 3.12 (CI uses `actions/setup-python` with `'3.12'`); standard library only — no third-party packages.

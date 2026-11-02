@@ -19,6 +19,11 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual((s.max_margin_fraction, s.max_gross_notional_multiple), (0.5, 10.0))
         self.assertEqual(s.news_window_minutes, 30)
 
+    def test_inconsistent_windows_rejected(self):
+        for bad in (dict(ema_slow=601), dict(atr_period=101), dict(breakout_lookback=99)):
+            with self.assertRaises(ValueError, msg=bad):
+                Settings(**bad)
+
     def test_settings_are_immutable(self):
         with self.assertRaises(Exception):
             Settings().risk_per_trade = 0.025

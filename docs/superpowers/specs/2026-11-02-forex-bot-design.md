@@ -135,7 +135,9 @@ Example (illustrative): NAV £1,000 → £2.50. EUR_USD stop 0.00060 + cost 0.00
 
 ### Approval (all required; rejection reason logged)
 1. Open bot positions < 4.
-2. Total open risk + new risk ≤ 1% NAV (trade risk = units × |entry − stop| × factor).
+2. Total open risk + new risk ≤ 1% NAV. Trade risk = units × (|entry − stop| + expected_round_trip_cost)
+   × factor, i.e. stop risk + cost risk, used identically for new candidates, open positions
+   and post-fill recomputation.
 3. Risk in same USD direction ≤ 0.5% NAV. Long USD = buy USD_JPY/USD_CAD or sell
    EUR_USD/GBP_USD/AUD_USD; short USD is the reverse.
 4. Entries (fills) in this pair today (UK date) < 2.

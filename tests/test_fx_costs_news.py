@@ -24,6 +24,7 @@ class CostTests(unittest.TestCase):
     def test_filter(self):
         self.assertTrue(passes_cost_filter(0.00012, 0.0010, S))    # 12% of stop
         self.assertFalse(passes_cost_filter(0.00012, 0.0006, S))   # 20% of stop
+        self.assertTrue(passes_cost_filter(0.15, 1.0, S))          # exactly 15% passes
 
 
 class NewsTests(unittest.TestCase):

@@ -84,6 +84,46 @@ class EvaluateTests(unittest.TestCase):
                          evaluate("EUR_USD", older_h1 + h1, older_m15 + m15, S))
 
 
+class EvaluateConditionTests(unittest.TestCase):
+    """Each rule on its own, so removing any single check fails a test."""
+    BREAKOUT = dict(close=1.1010, high=1.1012, low=1.0998)
+
+    def test_uptrend_but_h1_close_below_ema50(self):
+        h1 = h1_series(+0.0001)
+        last = h1[-1]
+        h1[-1] = Candle(last.time, last.open, last.open, 1.0558, 1.0560)  # close drops under EMA50
+        self.assertIsNone(evaluate("EUR_USD", h1, with_last(m15_flat(), **self.BREAKOUT), S))
+
+    def test_downtrend_but_h1_close_above_ema50(self):
+        h1 = h1_series(-0.0001, start=1.2)
+        last = h1[-1]
+        h1[-1] = Candle(last.time, last.open, 1.1442, last.open, 1.1440)
+        m15 = with_last(m15_flat(), close=1.0990, high=1.1002, low=1.0988)
+        self.assertIsNone(evaluate("EUR_USD", h1, m15, S))
+
+    def test_stale_short_breakdown_is_not_fresh(self):
+        m15 = m15_flat()
+        prev = m15[-2]
+        m15[-2] = Candle(prev.time, prev.open, prev.high, 1.0991, 1.0992)   # already broke down
+        m15 = with_last(m15, close=1.0988, high=1.0996, low=1.0987)
+        self.assertIsNone(evaluate("EUR_USD", h1_series(-0.0001, start=1.2), m15, S))
+
+    def test_lookback_is_exactly_20_candles(self):
+        def with_high_at(back):
+            m15 = m15_flat()
+            c = m15[-1 - back]
+            m15[-1 - back] = Candle(c.time, c.open, 1.1020, c.low, c.close)
+            return with_last(m15, **self.BREAKOUT)
+        self.assertIsNone(evaluate("EUR_USD", h1_series(+0.0001), with_high_at(20), S))
+        self.assertIsNotNone(evaluate("EUR_USD", h1_series(+0.0001), with_high_at(21), S))
+
+    def test_h1_candle_closing_after_signal_is_rejected(self):
+        # no lookahead: an H1 candle that closes after the M15 signal closes must never be used
+        h1 = h1_series(+0.0001)
+        h1 = h1[1:] + [Candle(h1[-1].time + timedelta(hours=1), *[h1[-1].close + 0.0001] * 4)]
+        self.assertIsNone(evaluate("EUR_USD", h1, with_last(m15_flat(), **self.BREAKOUT), S))
+
+
 class EntryWindowTests(unittest.TestCase):
     def check(self, y, mo, d, hh, mm, expected):
         self.assertEqual(entry_window_open(datetime(y, mo, d, hh, mm, tzinfo=UTC), S), expected)
@@ -102,6 +142,10 @@ class EntryWindowTests(unittest.TestCase):
         self.check(2026, 11, 6, 17, 45, True)   # Friday 17:45
         self.check(2026, 11, 6, 18, 0, False)   # Friday 18:00
         self.check(2026, 11, 7, 10, 0, False)   # Saturday
+
+    def test_naive_datetime_rejected(self):
+        with self.assertRaises(ValueError):
+            entry_window_open(datetime(2026, 11, 3, 9, 15), S)
 
 
 if __name__ == "__main__":
