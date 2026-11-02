@@ -26,6 +26,10 @@ Plans 2–4 are written after Plan 1 is merged, so they build on the real interf
   time; pass the decision time as `at` to `news_blocked`; assert both in engine tests.
 - **Plan 2:** `OpenPosition.risk_gbp` and post-fill risk recomputation use stop risk + cost risk
   (spec §6 rule 2), the same basis as new candidates.
+- **Plan 2/3:** pass only *completed* H1 candles to `strategy.evaluate`; a forming H1 candle makes it
+  return `None` by design (no-lookahead guard).
+- **Plan 2:** consider a small relative epsilon at the cost filter and risk caps for price-unit
+  rounding (current behaviour fails safe by rejecting).
 - **Plan 2/3:** P&L direction helpers (spec §4 `instruments.py`) are added where first needed.
 - **Plan 3:** the backtest cost filter must use a documented spread source (bid/ask of the
   decision candle's close) so live and backtest reject the same trades.
