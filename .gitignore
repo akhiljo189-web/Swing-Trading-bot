@@ -11,3 +11,5 @@ PROPOSAL.md
 *.db
 *.sqlite*
 .superpowers/
+.claude-flow/
+.swarm/
