@@ -2,10 +2,11 @@
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import date, datetime
 
 from fxbot.config import Settings
 from fxbot.instruments import usd_direction
-from fxbot.strategy import Signal
+from fxbot.strategy import LONDON, Signal
 
 
 @dataclass(frozen=True)
@@ -87,3 +88,17 @@ def evaluate(candidate: Candidate, account: AccountState, settings: Settings) ->
     if a.margin_used + margin > s.max_margin_fraction * a.nav:
         return Decision(False, "max margin")
     return Decision(True, "approved", units, risk, stop_risk, cost_risk, notional, margin)
+
+
+def uk_trading_day(at_utc: datetime) -> date:
+    return at_utc.astimezone(LONDON).date()
+
+
+def daily_pnl(start_nav: float, current_nav: float, deposits: float, withdrawals: float) -> float:
+    return current_nav - start_nav - deposits + withdrawals
+
+
+def daily_loss_breached(start_nav: float, current_nav: float, deposits: float,
+                        withdrawals: float, settings: Settings) -> bool:
+    pnl = daily_pnl(start_nav, current_nav, deposits, withdrawals)
+    return pnl <= -settings.daily_loss_limit * start_nav
