@@ -47,5 +47,13 @@ class FlattenTests(unittest.TestCase):
         self.assertEqual([level for level, _ in self.h.alerts], ["warning", "critical"])
 
 
+class FlattenUnknownStateTests(unittest.TestCase):
+    def test_broker_down_with_empty_ledger_is_not_reported_flat(self):
+        h = Harness(self, now=FRI_2000)
+        h.sim.fail_next = {"open_trades"}
+        self.assertGreaterEqual(h.engine.flatten(FRI_2000), 1)
+        self.assertEqual(h.alerts[-1][0], "critical")
+
+
 if __name__ == "__main__":
     unittest.main()

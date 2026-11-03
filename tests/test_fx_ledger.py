@@ -34,6 +34,9 @@ class LedgerTests(unittest.TestCase):
             f.write(b"this is not a database" * 100)
         with self.assertRaises(LedgerError):
             Ledger(bad)
+        with open(bad, "wb") as f:                         # lock must have been released
+            f.write(b"")
+        Ledger(bad).close()
 
     def test_client_id_can_never_be_reused(self):
         self.fill()
@@ -63,21 +66,21 @@ class LedgerTests(unittest.TestCase):
         self.fill("fxb-2", at=datetime(2026, 7, 7, 23, 30, tzinfo=UTC))   # 00:30 BST, 8 July
         self.assertEqual(self.ledger.entries_today(date(2026, 7, 8)), {"EUR_USD": 1})
 
-    def test_contributions_after_snapshot_only(self):
+    def test_contributions_after_snapshot_transaction_only(self):
         self.ledger.add_contribution(1, datetime(2026, 11, 3, 8, 0, tzinfo=UTC), 100.0)
         self.ledger.add_contribution(2, datetime(2026, 11, 3, 10, 0, tzinfo=UTC), 300.0)
         self.ledger.add_contribution(3, datetime(2026, 11, 3, 11, 0, tzinfo=UTC), -50.0)
         self.ledger.add_contribution(2, datetime(2026, 11, 3, 10, 0, tzinfo=UTC), 300.0)  # replay
-        self.assertEqual(self.ledger.contributions_since(T0), (300.0, 50.0))
+        self.assertEqual(self.ledger.contributions_since(1), (300.0, 50.0))
 
     def test_state_survives_restart(self):
         self.ledger.set_last_txn_id(42)
-        self.ledger.set_day_snapshot(date(2026, 11, 3), 1000.0, T0)
+        self.ledger.set_day_snapshot(date(2026, 11, 3), 1000.0, 41)
         self.ledger.latch_daily_loss(date(2026, 11, 3))
         self.ledger.pause("paused by user")
         self.reopen()
         self.assertEqual(self.ledger.last_txn_id, 42)
-        self.assertEqual(self.ledger.day_snapshot(), (date(2026, 11, 3), 1000.0, T0))
+        self.assertEqual(self.ledger.day_snapshot(), (date(2026, 11, 3), 1000.0, 41))
         self.assertTrue(self.ledger.daily_loss_latched(date(2026, 11, 3)))
         self.assertFalse(self.ledger.daily_loss_latched(date(2026, 11, 4)))
         self.assertEqual(self.ledger.pause_reason(), "paused by user")

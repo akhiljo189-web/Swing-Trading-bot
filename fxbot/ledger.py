@@ -5,6 +5,7 @@ LedgerLocked if another process holds it. Every write commits immediately.
 """
 import fcntl
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -76,9 +77,19 @@ class Ledger:
             if self._db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise LedgerError("ledger failed integrity check")
             self._db.executescript(SCHEMA)
-        except sqlite3.DatabaseError as exc:
+        except (sqlite3.DatabaseError, LedgerError) as exc:
             self.close()
             raise LedgerError(f"ledger unreadable: {exc}") from exc
+
+    @contextmanager
+    def _transaction(self):
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+        self._db.execute("COMMIT")
 
     def close(self) -> None:
         if getattr(self, "_db", None) is not None:
@@ -124,9 +135,10 @@ class Ledger:
         Abandoned client IDs are never reused, so an order cannot be resent.
         """
         abandoned = self.submitting()
-        self._db.execute("UPDATE positions SET status='abandoned' WHERE status='submitting'")
-        self.set("halt_reason", None)
-        self.set("pause_reason", None)
+        with self._transaction():
+            self._db.execute("UPDATE positions SET status='abandoned' WHERE status='submitting'")
+            self.set("halt_reason", None)
+            self.set("pause_reason", None)
         return abandoned
 
     # --- positions ---------------------------------------------------------
@@ -211,28 +223,30 @@ class Ledger:
         self._db.execute("INSERT OR IGNORE INTO contributions(txn_id, at, amount) VALUES(?, ?, ?)",
                          (txn_id, at.isoformat(), amount))
 
-    def contributions_since(self, since: datetime) -> tuple[float, float]:
-        """(deposits, withdrawals) strictly after `since`, both as positive numbers."""
+    def contributions_since(self, txn_id: int) -> tuple[float, float]:
+        """(deposits, withdrawals) in transactions after `txn_id`, both as positive numbers."""
         deposits = withdrawals = 0.0
-        for at, amount in self._db.execute("SELECT at, amount FROM contributions").fetchall():
-            if datetime.fromisoformat(at) > since:
-                if amount >= 0:
-                    deposits += amount
-                else:
-                    withdrawals -= amount
+        for (amount,) in self._db.execute("SELECT amount FROM contributions WHERE txn_id > ?",
+                                          (txn_id,)).fetchall():
+            if amount >= 0:
+                deposits += amount
+            else:
+                withdrawals -= amount
         return deposits, withdrawals
 
     # --- daily snapshot and latch -----------------------------------------
-    def day_snapshot(self) -> tuple[date, float, datetime] | None:
+    def day_snapshot(self) -> tuple[date, float, int] | None:
+        """(UK day, start-of-day NAV, broker transaction ID the NAV was read at)."""
         day = self.get("day")
         if day is None:
             return None
-        return date.fromisoformat(day), float(self.get("day_start_nav")), _dt(self.get("day_start_at"))
+        return date.fromisoformat(day), float(self.get("day_start_nav")), int(self.get("day_start_txn"))
 
-    def set_day_snapshot(self, day: date, start_nav: float, at: datetime) -> None:
-        self.set("day", day.isoformat())
-        self.set("day_start_nav", repr(start_nav))
-        self.set("day_start_at", at.isoformat())
+    def set_day_snapshot(self, day: date, start_nav: float, txn_id: int) -> None:
+        with self._transaction():
+            self.set("day", day.isoformat())
+            self.set("day_start_nav", repr(start_nav))
+            self.set("day_start_txn", str(txn_id))
 
     def latch_daily_loss(self, day: date) -> None:
         self.set("daily_loss_latched", day.isoformat())

@@ -18,7 +18,7 @@ class SimBroker:
         self.txns: list[Txn] = []
         # scripted behaviour
         self.fail_next: set[str] = set()     # method names that raise BrokerError once
-        self.order_modes: list[str] = []     # fill | reject | no_stop | timeout_filled | timeout_lost
+        self.order_modes: list[str] = []     # fill | reject | no_stop | timeout_filled | timeout_lost | timeout_rejected
         self.tp_failures = 0                 # next N set_take_profit calls fail
         self.close_failures = 0              # next N close_trade calls fail
         self.orders_sent: list[str] = []     # client IDs received, in order
@@ -45,6 +45,15 @@ class SimBroker:
                       stop_price, None)
         self._next_trade += 1
         self.trades[trade.trade_id] = trade
+        return trade
+
+    def late_fill(self, client_id: str, pair: str, units: int, stop_distance: float) -> Trade:
+        """Simulate an order whose fill reaches the broker after the bot stopped waiting."""
+        p = self.price_data[pair]
+        fill = p.ask if units > 0 else p.bid
+        trade = self.add_trade(pair, units, fill, client_id,
+                               fill - stop_distance if units > 0 else fill + stop_distance)
+        self._txn("FILL", client_id=client_id, trade_id=trade.trade_id, pair=pair, units=units, price=fill)
         return trade
 
     def close_at_broker(self, trade_id: str, price: float) -> None:
@@ -93,6 +102,9 @@ class SimBroker:
         mode = self.order_modes.pop(0) if self.order_modes else "fill"
         if mode == "timeout_lost":
             return OrderResult("unknown", reason="timeout")
+        if mode == "timeout_rejected":
+            self._txn("REJECT", client_id=client_id, pair=pair)
+            return OrderResult("unknown", reason="timeout")
         if any(t.client_id == client_id for t in self.trades.values()):
             self._txn("REJECT", client_id=client_id, pair=pair)
             return OrderResult("rejected", reason="CLIENT_ORDER_ID_ALREADY_EXISTS")
@@ -111,8 +123,8 @@ class SimBroker:
 
     def set_take_profit(self, trade_id: str, price: float) -> bool:
         self._check("set_take_profit")
-        if self.tp_failures:
-            self.tp_failures -= 1
+        if self.tp_failures or trade_id not in self.trades:
+            self.tp_failures = max(0, self.tp_failures - 1)
             return False
         t = self.trades[trade_id]
         self.trades[trade_id] = Trade(t.trade_id, t.pair, t.units, t.open_price, t.open_time,
@@ -121,8 +133,8 @@ class SimBroker:
 
     def close_trade(self, trade_id: str) -> bool:
         self._check("close_trade")
-        if self.close_failures:
-            self.close_failures -= 1
+        if self.close_failures or trade_id not in self.trades:
+            self.close_failures = max(0, self.close_failures - 1)
             return False
         p = self.price_data[self.trades[trade_id].pair]
         self.close_at_broker(trade_id, p.bid if self.trades[trade_id].units > 0 else p.ask)

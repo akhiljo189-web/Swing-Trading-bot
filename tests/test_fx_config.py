@@ -49,6 +49,9 @@ class InstrumentTests(unittest.TestCase):
         self.assertEqual(usd_direction("USD_JPY", +1), +1)
         self.assertEqual(usd_direction("USD_CAD", -1), -1)
 
+    def test_pair_without_usd_has_no_usd_direction(self):
+        self.assertEqual(usd_direction("EUR_GBP", +1), 0)
+
     def test_currencies(self):
         self.assertEqual(currencies("USD_CAD"), ("USD", "CAD"))
 

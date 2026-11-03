@@ -1604,3 +1604,38 @@ git commit -m "fxbot: add Friday flatten and weekend phases"
 - **Spec coverage:** §5 steps 1–10 → Task 3 (fetch, health, reconcile incl. pending orders, intents-before-send, never-resend, halt on unresolved, stop on fill, take-profit by price from fill, risk recomputed from fill, decisions recorded); §6 daily loss with latch and contributions → Tasks 2–3; §7 states (pause/halt), single instance lock, lost database, Friday flatten → Tasks 2–4; §9 engine scenarios incl. concurrency (five simultaneous signals, delayed fills/timeouts) and failure recovery (corrupt DB, lost connectivity, restart during unresolved order, alert channel failure) → Tasks 2–4. Telegram commands, healthcheck timer, scheduler retry and OANDA adapter are Plan 4; backtest fills are Plan 3.
 - **Verification before publishing:** the plan was applied task by task to a clean checkout (suite totals 97 → 105 → 131 → 135, all OK; resulting files byte-identical to the verified copy). 16 deliberate mutations of the engine's safety rules (unresolved halt, missing stop on fill and on an existing trade, untagged pause, duplicate check, block after unknown order, daily latch, time exit, news-down, stale candles, stale prices, take-profit retry, deadline alert, risk reservation, adoption of lost trades, unreliable snapshot) each make the suite fail. A 17th mutation exposed a redundant exception handler around `market_order`, which was removed (the cycle-level handler gives the same safe outcome).
 - **Placeholders:** none. **Type consistency:** names in Interfaces match the code blocks.
+
+## Amendments after the Plan 2 code review (implemented; code in the repo supersedes the blocks above)
+
+The review found one critical and several important issues, each reproduced with a failing test
+before fixing (17 regression tests added; 29 safety mutations now all fail the suite):
+
+- **Lost database:** replayed bot FILLs for unknown client IDs are recorded (reserving the ID);
+  a new ledger on an account with transaction history (`Account.last_txn_id > 0` on first cycle)
+  blocks entries for that UK day. Previously a closed-then-lost trade's client ID could be resent.
+- **Daily snapshot:** keyed to `Account.last_txn_id` (`set_day_snapshot(day, nav, txn_id)`,
+  `contributions_since(txn_id)`), removing a deposit/snapshot race; trades closed earlier the same
+  UK day have their realised P&L subtracted from start NAV instead of blocking the whole day.
+- **Fetch order:** transactions are read before open trades; a ledger position missing at the broker
+  is only written off on the second consecutive sighting (its CLOSE may not have been read yet).
+- **Robustness:** prices are fetched for configured pairs plus any open-trade pair; `_fill` tolerates
+  a missing price/unknown instrument; `usd_direction` returns 0 for non-USD pairs (`Instrument.usd_is_base`
+  removed); any reconciliation exception halts with a critical alert while protection still runs;
+  a `close_trade` error no longer skips the remaining positions; a prices failure still runs protection.
+- **Flatten:** broker unreachable never reports 0 remaining.
+- **Ledger:** integrity-check failure releases the lock; `resume` and `set_day_snapshot` are atomic.
+- **SimBroker:** `late_fill()`, `timeout_rejected` mode; unknown trade IDs return False.
+- **Removed:** the in-cycle `entries` update (unobservable: one signal per pair per cycle, and an
+  open position already blocks the pair).
+
+### Carried forward to Plans 3–4
+- **Plan 4 scheduler** must catch every exception from `run_cycle` (e.g. raw `sqlite3` errors are not
+  wrapped), halt and alert, and keep running the protection loop.
+- **Plan 4 `OandaBroker`:** `transactions_since(0)` on a fresh ledger must page through the full
+  account history; `pending_orders()` returns only standalone entry orders (not attached SL/TP);
+  round take-profit prices to instrument precision.
+- **Plan 4 alerts:** de-duplicate repeating alerts (e.g. the untagged-trade pause).
+- **Operational note:** the first UK day after deploying a brand-new ledger blocks entries (the
+  account already has history). Expected and safe; document it in the setup checklist.
+- **Plan 3:** extend SimBroker with candle-driven stop/target triggering and partial fills if needed.
+

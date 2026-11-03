@@ -6,15 +6,14 @@ from dataclasses import dataclass
 class Instrument:
     name: str
     pip: float
-    usd_is_base: bool
 
 
 INSTRUMENTS = {
-    "EUR_USD": Instrument("EUR_USD", 0.0001, False),
-    "GBP_USD": Instrument("GBP_USD", 0.0001, False),
-    "USD_JPY": Instrument("USD_JPY", 0.01, True),
-    "AUD_USD": Instrument("AUD_USD", 0.0001, False),
-    "USD_CAD": Instrument("USD_CAD", 0.0001, True),
+    "EUR_USD": Instrument("EUR_USD", 0.0001),
+    "GBP_USD": Instrument("GBP_USD", 0.0001),
+    "USD_JPY": Instrument("USD_JPY", 0.01),
+    "AUD_USD": Instrument("AUD_USD", 0.0001),
+    "USD_CAD": Instrument("USD_CAD", 0.0001),
 }
 
 
@@ -24,7 +23,8 @@ def currencies(pair: str) -> tuple[str, str]:
 
 
 def usd_direction(pair: str, side: int) -> int:
-    """+1 if the position is long USD, -1 if short USD."""
+    """+1 if the position is long USD, -1 if short USD, 0 if the pair has no USD leg."""
     if side not in (1, -1):
         raise ValueError("side must be +1 (buy) or -1 (sell)")
-    return side if INSTRUMENTS[pair].usd_is_base else -side
+    base, quote = currencies(pair)
+    return side if base == "USD" else -side if quote == "USD" else 0

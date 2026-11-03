@@ -56,6 +56,11 @@ class SimBrokerTests(unittest.TestCase):
         self.assertAlmostEqual(sim.txns[-1].amount, 1000 * 0.001 / 1.3, places=9)
         self.assertAlmostEqual(sim.nav, 1000 + 1000 * 0.001 / 1.3, places=9)
 
+    def test_unknown_trade_returns_false_like_a_broker(self):
+        sim = broker()
+        self.assertFalse(sim.close_trade("nope"))
+        self.assertFalse(sim.set_take_profit("nope", 1.2))
+
     def test_is_bot(self):
         self.assertTrue(is_bot("fxb-EUR_USD-20261103T0900-B"))
         self.assertFalse(is_bot(None))

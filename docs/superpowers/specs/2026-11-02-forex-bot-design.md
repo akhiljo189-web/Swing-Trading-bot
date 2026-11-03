@@ -167,12 +167,17 @@ not performance. Compounding follows from sizing on NAV.
 
 | State | Meaning | Clears |
 |---|---|---|
-| Entries paused | No new trades; existing managed | Automatically when cause clears (stale data, news feed down, Friday cutoff); daily-loss latch clears at next UK day; `/pause` clears only via `/resume` |
-| Halted | No new trades until user confirms | `/resume` (Telegram) or `resume` CLI. Triggers: missing stop, any unresolved order, auth failure, untagged trades/orders, corrupt or unreadable DB, repeated unexplained errors |
+| Entries paused | No new trades; existing managed | Automatically when cause clears (stale data, news feed down, Friday cutoff, untagged trades/standalone orders removed); daily-loss latch clears at next UK day; `/pause` clears only via `/resume` |
+| Halted | No new trades until user confirms | `/resume` (Telegram) or `resume` CLI. Triggers: missing stop, any unresolved order, reconciliation error, auth failure, corrupt or unreadable DB, repeated unexplained errors |
 
 - Reads retried 3× with backoff; order submits never blindly retried.
 - Crash/restart: Railway restarts the service; reconciliation runs before anything else.
-- Lost DB: rebuild open trades from tagged OANDA trades and transactions; block entries for the day.
+- Lost DB: rebuild open trades from tagged OANDA trades and replay transactions (every bot client ID
+  ever filled is reserved again, so none can be reused); a new or rebuilt ledger on an account
+  with transaction history blocks entries for the rest of that UK day.
+- Daily snapshot: start-of-day NAV is read with its broker transaction ID; contributions after that
+  transaction are excluded from P&L; trades closed earlier the same UK day (e.g. overnight) have
+  their realised P&L removed from the start-of-day NAV.
 - Single instance: 1 replica, exclusive file lock on the DB, client-ID dedupe.
 - Live mode requires `OANDA_ENV=live` **and** `LIVE_TRADING_CONFIRMED=yes`; otherwise practice only.
 - Time stored in UTC; sessions and trading day in Europe/London.

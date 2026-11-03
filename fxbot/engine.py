@@ -47,13 +47,22 @@ class Engine:
         except Exception:   # a broken alert channel must never stop the engine
             pass
 
-    def _fill(self, cid: str, side: int, trade_id: str, units: int, fill: float,
-              stop: float | None, cost: float, price: Price, at: datetime) -> None:
+    def _fill(self, cid: str, pair: str, trade_id: str, units: int, fill: float,
+              stop: float | None, price: Price | None, at: datetime, cost: float | None = None) -> None:
+        """Record a fill with risk recomputed from the actual fill and stop (spec §6 rule 2).
+
+        `price` may be None for history in a pair the bot no longer quotes; risk is then 0,
+        which only affects trades that are already closed.
+        """
         n = abs(units)
         stop_dist = abs(fill - stop) if stop is not None else 0.0
-        self.ledger.mark_filled(cid, trade_id, n, fill, stop, cost,
-                                n * stop_dist * price.loss_factor, n * cost * price.loss_factor,
-                                n * fill * price.value_factor, at)
+        if cost is None:
+            cost = (round_trip_cost(pair, price.ask - price.bid, self.s)
+                    if price is not None and pair in INSTRUMENTS else 0.0)
+        loss = price.loss_factor if price is not None else 0.0
+        value = price.value_factor if price is not None else 0.0
+        self.ledger.mark_filled(cid, trade_id, n, fill, stop, cost, n * stop_dist * loss,
+                                n * cost * loss, n * fill * value, at)
 
     def _set_take_profit(self, cid: str, trade_id: str, side: int, fill: float, stop: float) -> None:
         tp = fill + side * self.s.reward_r * abs(fill - stop)
@@ -76,44 +85,58 @@ class Engine:
                    f"{'closed' if closed else 'CLOSE FAILED - close it in the OANDA app'}; bot halted")
 
     # --- reconciliation (spec §5 step 3) ----------------------------------
-    def _reconcile(self, now: datetime, trades: list[Trade], prices: dict[str, Price]) -> None:
-        by_id = {t.trade_id: t for t in trades}
-        for txn in self.broker.transactions_since(self.ledger.last_txn_id):
-            if txn.kind == "FILL" and is_bot(txn.client_id):
-                pos = self.ledger.position(txn.client_id)
-                if pos is not None and pos.status in ("submitting", "abandoned"):
-                    t = by_id.get(txn.trade_id)
-                    stop = t.stop_price if t else None
-                    cost = round_trip_cost(txn.pair, prices[txn.pair].ask - prices[txn.pair].bid, self.s)
-                    self._fill(txn.client_id, pos.side, txn.trade_id, txn.units, txn.price, stop,
-                               cost, prices[txn.pair], txn.time)
-                    self.ledger.record(now, txn.pair, "reconciled", f"fill confirmed {txn.client_id}")
-            elif txn.kind == "CLOSE":
-                if self.ledger.mark_closed(txn.trade_id, txn.time, txn.amount):
-                    self.ledger.record(now, txn.pair, "closed", f"trade {txn.trade_id} P&L {txn.amount:.2f}")
-            elif txn.kind == "REJECT" and is_bot(txn.client_id):
-                pos = self.ledger.position(txn.client_id)
-                if pos is not None and pos.status == "submitting":
-                    self.ledger.mark_failed(txn.client_id, "rejected by broker")
-            elif txn.kind == "TRANSFER":
-                self.ledger.add_contribution(txn.txn_id, txn.time, txn.amount)
-            self.ledger.set_last_txn_id(txn.txn_id)
+    def _reconcile(self, now: datetime, txns: list, trades: list[Trade],
+                   prices: dict[str, Price]) -> None:
+        """Apply broker transactions, then adopt bot trades the ledger does not know.
 
-        known = {p.trade_id for p in self.ledger.open_positions()}
-        for t in trades:   # bot trades the ledger lost track of (e.g. database rebuilt)
+        Transactions are read BEFORE open trades, so a fill that lands between the two
+        reads is seen as an open trade and adopted (never mistaken for a closed one).
+        """
+        ledger = self.ledger
+        by_id = {t.trade_id: t for t in trades}
+        for txn in txns:
+            if txn.kind == "FILL" and is_bot(txn.client_id):
+                pos = ledger.position(txn.client_id)
+                if pos is None:   # history this ledger never saw: reserve the client ID
+                    ledger.create_intent(txn.client_id, txn.pair, 1 if txn.units > 0 else -1,
+                                         txn.time, now)
+                    pos = ledger.position(txn.client_id)
+                if pos.status in ("submitting", "abandoned"):
+                    t = by_id.get(txn.trade_id)
+                    self._fill(txn.client_id, txn.pair, txn.trade_id, txn.units, txn.price,
+                               t.stop_price if t else None, prices.get(txn.pair), txn.time)
+                    ledger.record(now, txn.pair, "reconciled", f"fill confirmed {txn.client_id}")
+            elif txn.kind == "CLOSE":
+                ledger.set(f"missing:{txn.trade_id}", None)
+                if ledger.mark_closed(txn.trade_id, txn.time, txn.amount):
+                    ledger.record(now, txn.pair, "closed", f"trade {txn.trade_id} P&L {txn.amount:.2f}")
+            elif txn.kind == "REJECT" and is_bot(txn.client_id):
+                pos = ledger.position(txn.client_id)
+                if pos is not None and pos.status == "submitting":
+                    ledger.mark_failed(txn.client_id, "rejected by broker")
+            elif txn.kind == "TRANSFER":
+                ledger.add_contribution(txn.txn_id, txn.time, txn.amount)
+            ledger.set_last_txn_id(txn.txn_id)
+
+        known = {p.trade_id for p in ledger.open_positions()}
+        for t in trades:   # bot trades the ledger lost track of (late fill, rebuilt database)
             if is_bot(t.client_id) and t.trade_id not in known:
-                side = 1 if t.units > 0 else -1
-                if self.ledger.position(t.client_id) is None:
-                    self.ledger.create_intent(t.client_id, t.pair, side, t.open_time, now)
-                cost = round_trip_cost(t.pair, prices[t.pair].ask - prices[t.pair].bid, self.s)
-                self._fill(t.client_id, side, t.trade_id, t.units, t.open_price, t.stop_price,
-                           cost, prices[t.pair], t.open_time)
+                if ledger.position(t.client_id) is None:
+                    ledger.create_intent(t.client_id, t.pair, 1 if t.units > 0 else -1, t.open_time, now)
+                self._fill(t.client_id, t.pair, t.trade_id, t.units, t.open_price, t.stop_price,
+                           prices.get(t.pair), t.open_time)
                 if t.take_profit_price is not None:
-                    self.ledger.set_take_profit(t.client_id, t.take_profit_price)
-                self.ledger.record(now, t.pair, "adopted", f"bot trade {t.trade_id} restored from broker")
-        for p in self.ledger.open_positions():
-            if p.trade_id not in by_id:   # closed at broker but no CLOSE transaction seen
-                self.ledger.mark_closed(p.trade_id, now, 0.0)
+                    ledger.set_take_profit(t.client_id, t.take_profit_price)
+                ledger.record(now, t.pair, "adopted", f"bot trade {t.trade_id} restored from broker")
+        for p in ledger.open_positions():
+            if p.trade_id in by_id:
+                continue
+            key = f"missing:{p.trade_id}"   # its CLOSE may simply not have been read yet
+            if ledger.get(key) is None:
+                ledger.set(key, now.isoformat())
+            else:
+                ledger.set(key, None)
+                ledger.mark_closed(p.trade_id, now, 0.0)
                 self.alert("warning", f"trade {p.trade_id} closed without a transaction; P&L unknown")
 
     # --- the cycle ---------------------------------------------------------
@@ -130,21 +153,34 @@ class Engine:
                 block(reason)
         try:
             account = self.broker.account()
+            txns = self.broker.transactions_since(ledger.last_txn_id)   # before open trades
             trades = self.broker.open_trades()
             pending = self.broker.pending_orders()
-            prices = self.broker.prices(s.pairs)
-            self._reconcile(now, trades, prices)
         except BrokerError as exc:
             self.alert("warning", f"broker unavailable: {exc}")
             ledger.record(now, None, "blocked", "broker unavailable")
             rep.blocked = "broker unavailable"
             return rep
+        try:
+            prices = self.broker.prices(tuple(dict.fromkeys(s.pairs + tuple(t.pair for t in trades))))
+        except BrokerError as exc:
+            self.alert("warning", f"prices unavailable: {exc}")
+            prices = None
+            block("broker unavailable")
+        if prices is not None:
+            try:
+                self._reconcile(now, txns, trades, prices)
+            except Exception as exc:   # never let bad data stop the protection steps below
+                ledger.halt(f"halted: reconciliation error: {exc}")
+                self.alert("critical", f"reconciliation failed ({exc}); bot halted")
+        if ledger.halt_reason():
+            block(ledger.halt_reason())
 
-        # account hygiene
+        # account hygiene and protection: these run even when entries are blocked
         if any(not is_bot(t.client_id) for t in trades) or any(not is_bot(o.client_id) for o in pending):
             block("paused: untagged trade or order on the account")
         unresolved = ledger.submitting()
-        if unresolved:
+        if unresolved and prices is not None:
             ledger.halt(f"halted: unresolved order {unresolved[0]}")
             self.alert("critical", f"order {unresolved[0]} could not be confirmed; bot halted")
             block(ledger.halt_reason())
@@ -153,40 +189,40 @@ class Engine:
                 self._close_unprotected(t.trade_id, now)
                 block(ledger.halt_reason())
 
-        # take-profit retries and time exits
         broker_trades = {t.trade_id: t for t in trades}
         closed_now: set[str] = set()
-        try:
-            for p in ledger.open_positions():
-                t = broker_trades.get(p.trade_id)
-                if t is None or t.stop_price is None:
-                    continue
-                if p.tp_price is None:
-                    if t.take_profit_price is not None:
-                        ledger.set_take_profit(p.client_id, t.take_profit_price)
-                    else:
-                        self._set_take_profit(p.client_id, p.trade_id, p.side, p.fill_price, t.stop_price)
-                if s.time_exit_minutes and now - p.opened_at >= timedelta(minutes=s.time_exit_minutes):
-                    if self.broker.close_trade(p.trade_id):
-                        closed_now.add(p.trade_id)
-                        rep.exits.append(p.trade_id)
-                        ledger.record(now, p.pair, "exit", f"time exit trade {p.trade_id}")
-                    else:
-                        self.alert("warning", f"time exit failed for trade {p.trade_id}; will retry")
-        except BrokerError as exc:
-            self.alert("warning", f"broker error managing trades: {exc}")
-            block("broker unavailable")
+        for p in ledger.open_positions():
+            t = broker_trades.get(p.trade_id)
+            if t is None or t.stop_price is None:
+                continue
+            if p.tp_price is None:
+                if t.take_profit_price is not None:
+                    ledger.set_take_profit(p.client_id, t.take_profit_price)
+                else:
+                    self._set_take_profit(p.client_id, p.trade_id, p.side, p.fill_price, t.stop_price)
+            if s.time_exit_minutes and now - p.opened_at >= timedelta(minutes=s.time_exit_minutes):
+                try:
+                    ok = self.broker.close_trade(p.trade_id)
+                except BrokerError:
+                    ok = False
+                if ok:
+                    closed_now.add(p.trade_id)
+                    rep.exits.append(p.trade_id)
+                    ledger.record(now, p.pair, "exit", f"time exit trade {p.trade_id}")
+                else:
+                    self.alert("warning", f"time exit failed for trade {p.trade_id}; will retry")
 
-        # daily loss (spec §6)
+        # daily loss (spec §6); the snapshot is tied to the transaction ID the NAV was read at
         day = uk_trading_day(now)
+        if ledger.get("initialized") is None:
+            ledger.set("initialized", now.isoformat())
+            if account.last_txn_id > 0:   # new or rebuilt ledger on an account with history
+                ledger.set("daily_snapshot_unreliable", day.isoformat())
         snap = ledger.day_snapshot()
         if snap is None or snap[0] != day:
-            activity = any((p.opened_at and uk_trading_day(p.opened_at) == day) or
-                           (p.closed_at and uk_trading_day(p.closed_at) == day)
-                           for p in ledger.all_positions())
-            ledger.set_day_snapshot(day, account.nav, now)
-            if activity:   # trading already happened today: start-of-day NAV is unknown
-                ledger.set("daily_snapshot_unreliable", day.isoformat())
+            realized_today = sum(p.realized_pl or 0.0 for p in ledger.all_positions()
+                                 if p.closed_at and uk_trading_day(p.closed_at) == day)
+            ledger.set_day_snapshot(day, account.nav - realized_today, account.last_txn_id)
             snap = ledger.day_snapshot()
         if ledger.get("daily_snapshot_unreliable") == day.isoformat():
             block("no reliable daily snapshot today")
@@ -294,9 +330,8 @@ class Engine:
                 ledger.record(now, sig.pair, "unknown", f"order {cid} outcome unknown")
                 continue
 
-            price = prices[sig.pair]
-            self._fill(cid, sig.side, result.trade_id, result.units, result.fill_price,
-                       result.stop_price, c.cost, price, now)
+            self._fill(cid, sig.pair, result.trade_id, result.units, result.fill_price,
+                       result.stop_price, prices[sig.pair], now, c.cost)
             rep.filled.append(cid)
             ledger.record(now, sig.pair, "filled", f"{cid} {result.units} @ {result.fill_price}")
             if result.stop_price is None:
@@ -307,7 +342,6 @@ class Engine:
             filled = ledger.position(cid)   # risk recomputed from the actual fill
             positions.append(OpenPosition(sig.pair, sig.side, filled.units, filled.risk_gbp,
                                           filled.notional_gbp))
-            entries = {**entries, sig.pair: entries.get(sig.pair, 0) + 1}
             margin_used += filled.notional_gbp * c.margin_rate
 
     # --- Friday flatten and /flatten (spec §7) ------------------------------
@@ -317,7 +351,7 @@ class Engine:
             bot_trades = [t for t in self.broker.open_trades() if is_bot(t.client_id)]
         except BrokerError as exc:
             self.alert("warning", f"flatten: broker unavailable: {exc}")
-            remaining = len(self.ledger.open_positions())
+            remaining = max(1, len(self.ledger.open_positions()))   # unknown is never "flat"
         else:
             remaining = 0
             for t in bot_trades:
