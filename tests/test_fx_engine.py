@@ -422,6 +422,85 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(h.sim.trades, {})
         self.assertTrue(rep.blocked.startswith("halted: reconciliation error"))
 
+    def overnight_stop_out(self, h):
+        set_market(h.sim, "EUR_USD", breakout=+1)
+        h.cycle()
+        p = h.ledger.position(EUR_ID)
+        h.sim.now = datetime(2026, 11, 4, 0, 5, tzinfo=UTC)
+        h.sim.close_at_broker(p.trade_id, p.stop_price)
+        day2 = datetime(2026, 11, 4, 0, 15, 10, tzinfo=UTC)
+        for pair in PAIRS:
+            set_market(h.sim, pair, now=day2)
+        return day2, h.sim.txns[-1].amount
+
+    def test_no_daily_snapshot_until_reconciled(self):
+        h = Harness(self, settings=Settings(time_exit_minutes=None))
+        day2, loss = self.overnight_stop_out(h)
+        h.sim.fail_next = {"prices"}
+        self.assertEqual(h.cycle(day2).blocked, "broker unavailable")
+        self.assertNotEqual(h.ledger.day_snapshot()[0], uk_trading_day(day2))
+        h.cycle(day2 + timedelta(seconds=30))
+        self.assertAlmostEqual(h.ledger.day_snapshot()[1], h.sim.nav - loss, places=9)
+
+    def test_close_after_nav_read_is_not_subtracted_from_snapshot(self):
+        h = Harness(self, settings=Settings(time_exit_minutes=None))
+        set_market(h.sim, "EUR_USD", breakout=+1)
+        h.cycle()
+        p = h.ledger.position(EUR_ID)
+        day2 = datetime(2026, 11, 4, 0, 15, 10, tzinfo=UTC)
+        for pair in PAIRS:
+            set_market(h.sim, pair, now=day2)
+        real = h.sim.account
+
+        def racing():
+            acct = real()
+            h.sim.close_at_broker(p.trade_id, p.tp_price)      # closes after NAV was read
+            h.sim.account = real
+            return acct
+        h.sim.account = racing
+        nav_before = h.sim.nav
+        h.cycle(day2)
+        self.assertAlmostEqual(h.ledger.day_snapshot()[1], nav_before, places=9)
+
+    def test_open_trade_without_a_price_halts_instead_of_recording_zero_risk(self):
+        h = Harness(self)
+        set_market(h.sim, "EUR_USD", breakout=+1)
+        h.sim.order_modes = ["timeout_filled"]
+        h.cycle()
+        real = h.sim.prices
+        h.sim.prices = lambda pairs: {k: v for k, v in real(pairs).items() if k != "EUR_USD"}
+        rep = h.cycle(LATER)
+        self.assertTrue(rep.blocked.startswith("halted: reconciliation error"))
+        self.assertNotEqual(h.ledger.position(EUR_ID).risk_gbp, 0.0)
+
+    def test_adopting_a_trade_without_a_price_halts_instead_of_zero_risk(self):
+        h = Harness(self)
+        h.sim.add_trade("EUR_USD", 1000, 1.1, "fxb-EUR_USD-20261103T0800-B", 1.099)
+        real = h.sim.prices
+        h.sim.prices = lambda pairs: {k: v for k, v in real(pairs).items() if k != "EUR_USD"}
+        rep = h.cycle()
+        self.assertTrue(rep.blocked.startswith("halted: reconciliation error"))
+        self.assertIsNone(h.ledger.position("fxb-EUR_USD-20261103T0800-B"))
+
+    def test_missing_price_for_configured_pair_is_unhealthy_not_a_crash(self):
+        h = Harness(self)
+        real = h.sim.prices
+        h.sim.prices = lambda pairs: {k: v for k, v in real(pairs).items() if k != "GBP_USD"}
+        self.assertEqual(h.cycle().blocked, "stale or untradeable price GBP_USD")
+
+    def test_missing_marker_cleared_when_trade_reappears(self):
+        h = Harness(self)
+        set_market(h.sim, "EUR_USD", breakout=+1)
+        h.cycle()
+        tid = h.ledger.position(EUR_ID).trade_id
+        real = h.sim.open_trades
+        h.sim.open_trades = lambda: [t for t in real() if t.trade_id != tid]   # briefly omitted
+        h.cycle(LATER)
+        h.sim.open_trades = real
+        h.cycle(LATER + timedelta(seconds=5))
+        self.assertIsNone(h.ledger.get(f"missing:{tid}"))
+        self.assertEqual(h.ledger.position(EUR_ID).status, "filled")
+
     def test_deposit_racing_the_snapshot_is_not_a_loss(self):
         h = Harness(self)
         h.cycle()                                             # ledger initialised on day 1

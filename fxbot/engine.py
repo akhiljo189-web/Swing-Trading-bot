@@ -51,8 +51,8 @@ class Engine:
               stop: float | None, price: Price | None, at: datetime, cost: float | None = None) -> None:
         """Record a fill with risk recomputed from the actual fill and stop (spec §6 rule 2).
 
-        `price` may be None for history in a pair the bot no longer quotes; risk is then 0,
-        which only affects trades that are already closed.
+        `price` may be None only for history whose trade is already closed (risk is then 0);
+        `_reconcile` refuses a missing price for a trade that is still open.
         """
         n = abs(units)
         stop_dist = abs(fill - stop) if stop is not None else 0.0
@@ -103,12 +103,14 @@ class Engine:
                     pos = ledger.position(txn.client_id)
                 if pos.status in ("submitting", "abandoned"):
                     t = by_id.get(txn.trade_id)
+                    if t is not None and txn.pair not in prices:
+                        raise ValueError(f"no price for open trade {txn.trade_id} ({txn.pair})")
                     self._fill(txn.client_id, txn.pair, txn.trade_id, txn.units, txn.price,
                                t.stop_price if t else None, prices.get(txn.pair), txn.time)
                     ledger.record(now, txn.pair, "reconciled", f"fill confirmed {txn.client_id}")
             elif txn.kind == "CLOSE":
                 ledger.set(f"missing:{txn.trade_id}", None)
-                if ledger.mark_closed(txn.trade_id, txn.time, txn.amount):
+                if ledger.mark_closed(txn.trade_id, txn.time, txn.amount, txn.txn_id):
                     ledger.record(now, txn.pair, "closed", f"trade {txn.trade_id} P&L {txn.amount:.2f}")
             elif txn.kind == "REJECT" and is_bot(txn.client_id):
                 pos = ledger.position(txn.client_id)
@@ -121,6 +123,8 @@ class Engine:
         known = {p.trade_id for p in ledger.open_positions()}
         for t in trades:   # bot trades the ledger lost track of (late fill, rebuilt database)
             if is_bot(t.client_id) and t.trade_id not in known:
+                if t.pair not in prices:
+                    raise ValueError(f"no price for open trade {t.trade_id} ({t.pair})")
                 if ledger.position(t.client_id) is None:
                     ledger.create_intent(t.client_id, t.pair, 1 if t.units > 0 else -1, t.open_time, now)
                 self._fill(t.client_id, t.pair, t.trade_id, t.units, t.open_price, t.stop_price,
@@ -129,9 +133,10 @@ class Engine:
                     ledger.set_take_profit(t.client_id, t.take_profit_price)
                 ledger.record(now, t.pair, "adopted", f"bot trade {t.trade_id} restored from broker")
         for p in ledger.open_positions():
-            if p.trade_id in by_id:
-                continue
             key = f"missing:{p.trade_id}"   # its CLOSE may simply not have been read yet
+            if p.trade_id in by_id:
+                ledger.set(key, None)
+                continue
             if ledger.get(key) is None:
                 ledger.set(key, now.isoformat())
             else:
@@ -167,9 +172,11 @@ class Engine:
             self.alert("warning", f"prices unavailable: {exc}")
             prices = None
             block("broker unavailable")
+        reconciled = False
         if prices is not None:
             try:
                 self._reconcile(now, txns, trades, prices)
+                reconciled = True
             except Exception as exc:   # never let bad data stop the protection steps below
                 ledger.halt(f"halted: reconciliation error: {exc}")
                 self.alert("critical", f"reconciliation failed ({exc}); bot halted")
@@ -214,24 +221,30 @@ class Engine:
 
         # daily loss (spec §6); the snapshot is tied to the transaction ID the NAV was read at
         day = uk_trading_day(now)
-        if ledger.get("initialized") is None:
+        snap = ledger.day_snapshot()
+        if reconciled and ledger.get("initialized") is None:
             ledger.set("initialized", now.isoformat())
             if account.last_txn_id > 0:   # new or rebuilt ledger on an account with history
                 ledger.set("daily_snapshot_unreliable", day.isoformat())
-        snap = ledger.day_snapshot()
-        if snap is None or snap[0] != day:
+        if (snap is None or snap[0] != day) and reconciled:
+            # closes already inside this NAV reading (same UK day) still count toward today
             realized_today = sum(p.realized_pl or 0.0 for p in ledger.all_positions()
-                                 if p.closed_at and uk_trading_day(p.closed_at) == day)
+                                 if p.closed_at and uk_trading_day(p.closed_at) == day
+                                 and (p.close_txn_id is None or p.close_txn_id <= account.last_txn_id))
             ledger.set_day_snapshot(day, account.nav - realized_today, account.last_txn_id)
             snap = ledger.day_snapshot()
-        if ledger.get("daily_snapshot_unreliable") == day.isoformat():
-            block("no reliable daily snapshot today")
-        deposits, withdrawals = ledger.contributions_since(snap[2])
-        if ledger.daily_loss_latched(day) or daily_loss_breached(snap[1], account.nav, deposits, withdrawals, s):
-            if not ledger.daily_loss_latched(day):
-                ledger.latch_daily_loss(day)
-                self.alert("warning", "daily loss limit reached; no new entries until tomorrow")
-            block("daily loss limit reached")
+        if snap is None or snap[0] != day:   # cannot snapshot before reconciling
+            block("no daily snapshot yet")
+        else:
+            if ledger.get("daily_snapshot_unreliable") == day.isoformat():
+                block("no reliable daily snapshot today")
+            deposits, withdrawals = ledger.contributions_since(snap[2])
+            if ledger.daily_loss_latched(day) or daily_loss_breached(snap[1], account.nav, deposits,
+                                                                     withdrawals, s):
+                if not ledger.daily_loss_latched(day):
+                    ledger.latch_daily_loss(day)
+                    self.alert("warning", "daily loss limit reached; no new entries until tomorrow")
+                block("daily loss limit reached")
 
         events = self.news(now)
         if events is None:
@@ -259,8 +272,8 @@ class Engine:
             m15[pair] = self.broker.candles(pair, "M15", s.m15_window)
             if not h1[pair] or not m15[pair] or h1[pair][-1].time != last_h1 or m15[pair][-1].time != last_m15:
                 return h1, m15, f"stale candles {pair}"
-            p = prices[pair]
-            if (not p.tradeable or p.loss_factor <= 0 or p.value_factor <= 0
+            p = prices.get(pair)
+            if (p is None or not p.tradeable or p.loss_factor <= 0 or p.value_factor <= 0
                     or now - p.time > timedelta(seconds=s.price_max_age_seconds)):
                 return h1, m15, f"stale or untradeable price {pair}"
         return h1, m15, None

@@ -1628,6 +1628,18 @@ before fixing (17 regression tests added; 29 safety mutations now all fail the s
 - **Removed:** the in-cycle `entries` update (unobservable: one signal per pair per cycle, and an
   open position already blocks the pair).
 
+### Second review round (re-review of the fixes)
+- **Daily snapshot is taken only after a successful reconciliation** in that cycle; until then
+  entries are blocked with `"no daily snapshot yet"` (otherwise an overnight loss not yet reconciled
+  would drop out of the daily limit).
+- **Positions record `close_txn_id`**; only closes at or before the NAV reading's transaction are
+  subtracted from start-of-day NAV.
+- **No price for a still-open trade → reconciliation error (halt)**, never a position recorded with
+  risk 0; `_healthy` treats a missing configured-pair price as `"stale or untradeable price <pair>"`.
+- **`missing:` marker is cleared** when the trade reappears at the broker.
+- Accepted as-is: a deterministic reconciliation error re-halts after every `/resume` (stop-loss
+  protection still runs); fixed by removing the bad data, not by code.
+
 ### Carried forward to Plans 3–4
 - **Plan 4 scheduler** must catch every exception from `run_cycle` (e.g. raw `sqlite3` errors are not
   wrapped), halt and alert, and keep running the protection loop.
@@ -1637,5 +1649,6 @@ before fixing (17 regression tests added; 29 safety mutations now all fail the s
 - **Plan 4 alerts:** de-duplicate repeating alerts (e.g. the untagged-trade pause).
 - **Operational note:** the first UK day after deploying a brand-new ledger blocks entries (the
   account already has history). Expected and safe; document it in the setup checklist.
+- **Plan 4 `OandaBroker.prices()`** must raise `BrokerError` (not `KeyError`) for unknown instruments.
 - **Plan 3:** extend SimBroker with candle-driven stop/target triggering and partial fills if needed.
 

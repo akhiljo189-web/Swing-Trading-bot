@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS positions (
     candle_time TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
     trade_id TEXT, units INTEGER, fill_price REAL, stop_price REAL, tp_price REAL,
     cost REAL, risk_gbp REAL, stop_risk_gbp REAL, cost_risk_gbp REAL, notional_gbp REAL,
-    opened_at TEXT, closed_at TEXT, realized_pl REAL, note TEXT);
+    opened_at TEXT, closed_at TEXT, realized_pl REAL, close_txn_id INTEGER, note TEXT);
 CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, pair TEXT, outcome TEXT NOT NULL,
     reason TEXT NOT NULL);
@@ -57,6 +57,7 @@ class Position:
     opened_at: datetime | None
     closed_at: datetime | None
     realized_pl: float | None
+    close_txn_id: int | None   # broker transaction that closed it (None if written off)
 
 
 def _dt(value: str | None) -> datetime | None:
@@ -170,11 +171,12 @@ class Ledger:
         self._db.execute("UPDATE positions SET status='failed', note=? WHERE client_id=?",
                          (note, client_id))
 
-    def mark_closed(self, trade_id: str, closed_at: datetime, realized_pl: float) -> bool:
+    def mark_closed(self, trade_id: str, closed_at: datetime, realized_pl: float,
+                    txn_id: int | None = None) -> bool:
         cur = self._db.execute(
-            "UPDATE positions SET status='closed', closed_at=?, realized_pl=?"
+            "UPDATE positions SET status='closed', closed_at=?, realized_pl=?, close_txn_id=?"
             " WHERE trade_id=? AND status='filled'",
-            (closed_at.isoformat(), realized_pl, trade_id))
+            (closed_at.isoformat(), realized_pl, txn_id, trade_id))
         return cur.rowcount == 1
 
     def set_take_profit(self, client_id: str, price: float) -> None:
@@ -184,10 +186,10 @@ class Ledger:
         rows = self._db.execute(
             "SELECT client_id, pair, side, candle_time, status, trade_id, units, fill_price,"
             " stop_price, tp_price, cost, risk_gbp, stop_risk_gbp, cost_risk_gbp, notional_gbp,"
-            f" opened_at, closed_at, realized_pl FROM positions WHERE {where} ORDER BY created_at",
-            args).fetchall()
+            f" opened_at, closed_at, realized_pl, close_txn_id FROM positions WHERE {where}"
+            " ORDER BY created_at", args).fetchall()
         return [Position(r[0], r[1], r[2], _dt(r[3]), r[4], r[5], r[6], r[7], r[8], r[9], r[10],
-                         r[11], r[12], r[13], r[14], _dt(r[15]), _dt(r[16]), r[17]) for r in rows]
+                         r[11], r[12], r[13], r[14], _dt(r[15]), _dt(r[16]), r[17], r[18]) for r in rows]
 
     def position(self, client_id: str) -> Position | None:
         found = self._positions("client_id=?", (client_id,))
