@@ -73,12 +73,12 @@ def grid_settings(settings: Settings, grid: dict) -> list[Settings]:
     return [replace(settings, **dict(zip(keys, values))) for values in itertools.product(*grid.values())]
 
 
-def chain(history, plan: list[tuple], news, nav: float = 1000.0, signal_fn=None) -> BacktestResult:
+def chain(history, plan: list[tuple], news, nav: float = 1000.0, signal_fn=None, s10=None) -> BacktestResult:
     """Run consecutive (settings, start, end) windows, carrying NAV forward; merge results."""
     merged = BacktestResult(nav, nav, [], [])
     for settings, start, end in plan:
         extra = {"signal_fn": signal_fn} if signal_fn is not None else {}
-        r = run(history, settings, start, end, nav=merged.end_nav, news=news, **extra)
+        r = run(history, settings, start, end, nav=merged.end_nav, news=news, s10=s10, **extra)
         merged.end_nav = r.end_nav
         merged.trades += r.trades
         merged.nav_marks += r.nav_marks
@@ -92,13 +92,13 @@ def chain(history, plan: list[tuple], news, nav: float = 1000.0, signal_fn=None)
 
 
 def walk_forward(history, settings, start, end, news, train_months=24, test_months=6,
-                 grid=GRID, min_trades=30) -> list[tuple[Settings, datetime, datetime]]:
+                 grid=GRID, min_trades=30, s10=None) -> list[tuple[Settings, datetime, datetime]]:
     """Pick the best grid settings on each training window (expectancy R, at least `min_trades`)."""
     plan = []
     for tr_s, tr_e, te_s, te_e in windows(start, end, train_months, test_months):
         best, best_score = settings, float("-inf")
         for candidate in grid_settings(settings, grid):
-            m = summarize(run(history, candidate, tr_s, tr_e, news=news), bootstrap_runs=0)
+            m = summarize(run(history, candidate, tr_s, tr_e, news=news, s10=s10), bootstrap_runs=0)
             score = m["expectancy_r"] if m["trades"] >= min_trades else float("-inf")
             if score > best_score:
                 best, best_score = candidate, score
@@ -110,27 +110,32 @@ def walk_forward(history, settings, start, end, news, train_months=24, test_mont
 _WORKER: dict = {}
 
 
-def _init_worker(history, plan, news, base):
-    _WORKER.update(history=history, plan=plan, news=news, base=base)
+def _init_worker(history, plan, news, base, s10=None):
+    _WORKER.update(history=history, plan=plan, news=news, base=base, s10=s10)
 
 
 def _no_skill_run(seed: int) -> float:
     w = _WORKER
-    r = chain(w["history"], w["plan"], w["news"], signal_fn=random_direction(w["base"], seed))
+    r = chain(w["history"], w["plan"], w["news"], signal_fn=random_direction(w["base"], seed), s10=w.get("s10"))
     return summarize(r, bootstrap_runs=0)["expectancy_r"]
 
 
-def no_skill(history, plan, news, base, runs: int, processes: int | None) -> list[float]:
-    """Expectancy (R) of `runs` seeded random-direction runs over the walk-forward windows."""
+def no_skill(history, plan, news, base, runs: int, processes: int | None, s10=None) -> list[float]:
+    """Expectancy (R) of `runs` seeded random-direction runs over the walk-forward windows.
+
+    Workers get a read-only S10 cache: they never call the API or write the cache file.
+    """
+    if s10 is not None and hasattr(s10, "read_only"):
+        s10 = s10.read_only()
     if processes == 1:
-        _init_worker(history, plan, news, base)
+        _init_worker(history, plan, news, base, s10)
         return [_no_skill_run(seed) for seed in range(runs)]
     methods = multiprocessing.get_all_start_methods()
     context = multiprocessing.get_context("fork" if "fork" in methods else None)
     gc.freeze()   # keep forked workers from copying the shared history pages
     try:
         with ProcessPoolExecutor(processes, mp_context=context, initializer=_init_worker,
-                                 initargs=(history, plan, news, base)) as pool:
+                                 initargs=(history, plan, news, base, s10)) as pool:
             return list(pool.map(_no_skill_run, range(runs), chunksize=8))
     finally:
         gc.unfreeze()
@@ -160,17 +165,17 @@ def gate_b(report: dict) -> dict:
 
 def research(history: History, settings: Settings, start: datetime, end: datetime,
              news: list[NewsEvent] | None, *, train_months=24, test_months=6, grid=GRID,
-             no_skill_runs=1000, processes: int | None = None) -> dict:
+             no_skill_runs=1000, processes: int | None = None, s10=None) -> dict:
     """Every comparison in Gate B uses the same walk-forward windows and chosen settings."""
-    plan = walk_forward(history, settings, start, end, news, train_months, test_months, grid)
+    plan = walk_forward(history, settings, start, end, news, train_months, test_months, grid, s10=s10)
     if not plan:
         raise ValueError("period too short for one training plus one test window")
     oos_start = plan[0][1]
 
     def variant(**changes) -> BacktestResult:
-        return chain(history, [(replace(s, **changes), a, b) for s, a, b in plan], news)
+        return chain(history, [(replace(s, **changes), a, b) for s, a, b in plan], news, s10=s10)
 
-    wf = chain(history, plan, news)
+    wf = chain(history, plan, news, s10=s10)
     sensitivity = {str(sl): summarize(variant(slippage_pips_per_side=sl), bootstrap_runs=0)
                    for sl in SLIPPAGE}
     report = {
@@ -181,11 +186,13 @@ def research(history: History, settings: Settings, start: datetime, end: datetim
         "walk_forward_slippage_0.6": sensitivity["0.6"],
         "slippage_sensitivity": sensitivity,
         "time_exit_off": summarize(variant(time_exit_minutes=None), bootstrap_runs=0),
-        "news_filter_off": summarize(chain(history, plan, None), bootstrap_runs=0),
-        "trend_baseline": summarize(chain(history, plan, news, signal_fn=trend_baseline), bootstrap_runs=0),
+        "news_filter_off": summarize(chain(history, plan, None, s10=s10), bootstrap_runs=0),
+        "trend_baseline": summarize(chain(history, plan, news, signal_fn=trend_baseline, s10=s10),
+                                    bootstrap_runs=0),
         "no_skill": {"runs": no_skill_runs,
-                     "expectancy_r": no_skill(history, plan, news, wf.signals, no_skill_runs, processes)},
-        "fixed_params": summarize(run(history, settings, oos_start, end, news=news), bootstrap_runs=0),
+                     "expectancy_r": no_skill(history, plan, news, wf.signals, no_skill_runs, processes, s10)},
+        "fixed_params": summarize(run(history, settings, oos_start, end, news=news, s10=s10), bootstrap_runs=0),
+        "entry_fills": "S10 quotes where available" if s10 is not None else "next M15 open + double slippage",
     }
     report["gate_b"] = gate_b(report)
     return report
