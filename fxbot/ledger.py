@@ -65,7 +65,8 @@ def _dt(value: str | None) -> datetime | None:
 
 
 class Ledger:
-    def __init__(self, path: str):
+    def __init__(self, path: str, durable: bool = True):
+        """durable=False skips disk syncs: only for throwaway backtest ledgers."""
         self._lock = open(path + ".lock", "w")
         try:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -77,6 +78,9 @@ class Ledger:
             self._db.row_factory = sqlite3.Row
             if self._db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise LedgerError("ledger failed integrity check")
+            if not durable:
+                self._db.execute("PRAGMA synchronous=OFF")
+                self._db.execute("PRAGMA journal_mode=MEMORY")
             self._db.executescript(SCHEMA)
         except (sqlite3.DatabaseError, LedgerError) as exc:
             self.close()

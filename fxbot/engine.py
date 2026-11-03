@@ -18,6 +18,7 @@ from fxbot.strategy import LONDON, entry_window_open, evaluate as signal_for
 
 NewsSource = Callable[[datetime], list[NewsEvent] | None]   # None = feed unavailable
 Alert = Callable[[str, str], None]                           # (level, text)
+SignalFn = Callable[..., object]                             # same signature as strategy.evaluate
 
 M15 = timedelta(minutes=15)
 
@@ -37,8 +38,10 @@ def client_id(pair: str, side: int, candle_time: datetime) -> str:
 
 class Engine:
     def __init__(self, broker: Broker, ledger: Ledger, settings: Settings,
-                 news: NewsSource, alert: Alert):
+                 news: NewsSource, alert: Alert, signal_fn: SignalFn = signal_for):
+        """`signal_fn` defaults to the strategy; backtests pass baselines or a cached wrapper."""
         self.broker, self.ledger, self.s, self.news, self._alert_fn = broker, ledger, settings, news, alert
+        self.signal_fn = signal_fn
 
     # --- helpers -----------------------------------------------------------
     def alert(self, level: str, text: str) -> None:
@@ -288,7 +291,7 @@ class Engine:
 
         candidates = []
         for pair in s.pairs:
-            sig = signal_for(pair, h1[pair], m15[pair], s)
+            sig = self.signal_fn(pair, h1[pair], m15[pair], s)
             if sig is None:
                 continue
             price = prices[pair]

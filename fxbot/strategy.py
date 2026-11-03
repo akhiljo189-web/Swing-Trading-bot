@@ -27,7 +27,8 @@ class Signal:
     stop_distance: float    # in price units
 
 
-def _trend(h1: Sequence[Candle], s: Settings) -> int:
+def trend_direction(h1: Sequence[Candle], s: Settings) -> int:
+    """+1 / -1 when the H1 EMA filter allows longs / shorts, else 0."""
     closes = [c.close for c in h1]
     fast = ema(closes, s.ema_fast)[-1]
     slow = ema(closes, s.ema_slow)[-1]
@@ -62,9 +63,10 @@ def evaluate(pair: str, h1: Sequence[Candle], m15: Sequence[Candle],
     # no lookahead: the H1 candle must have closed by the time the M15 signal candle closes
     if h1[-1].time + timedelta(hours=1) > m15[-1].time + timedelta(minutes=15):
         return None
-    trend = _trend(h1, s)
-    if trend == 0 or _breakout(m15, s.breakout_lookback) != trend:
+    breakout = _breakout(m15, s.breakout_lookback)   # cheap check first; EMAs only on breakouts
+    if breakout == 0 or trend_direction(h1, s) != breakout:
         return None
+    trend = breakout
     a = atr([c.high for c in m15], [c.low for c in m15], [c.close for c in m15], s.atr_period)[-1]
     return Signal(pair, trend, m15[-1].time, s.stop_atr_mult * a)
 
