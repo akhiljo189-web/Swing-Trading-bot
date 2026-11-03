@@ -74,8 +74,8 @@ def run(history: History, settings: Settings, start: datetime, end: datetime, *,
         s10: S10Lookup | None = None, skip_idle: bool = True) -> BacktestResult:
     """Replay M15 candles opening in [start, end). `news=None` means no calendar (filter off).
 
-    Trades still open after the last candle are closed at the next available price, so every
-    trade is counted. `skip_idle=False` runs every cycle (slow; for verification only).
+    Trades still open after the last cycle are closed at that cycle's decision time (falling back
+    to the last completed close with double slippage if no price exists), so every trade is counted. `skip_idle=False` runs every cycle (slow; for verification only).
     """
     events = list(news or [])
     broker = BacktestBroker(history, settings, nav, s10)
