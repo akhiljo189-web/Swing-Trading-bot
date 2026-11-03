@@ -1,4 +1,4 @@
-name: Test paper-trading workbench
+name: Test fxbot
 on: [push, pull_request]
 permissions:
   contents: read

@@ -1,0 +1,7 @@
+.git
+tests
+docs
+data
+runtime
+__pycache__
+*.db
