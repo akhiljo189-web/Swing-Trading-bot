@@ -1844,6 +1844,11 @@ class CliTests(unittest.TestCase):
         code, out, _ = run("resume", "--data-dir", self.dir)
         self.assertIn("Not paused", out)
 
+    def test_status_with_missing_data_dir_is_a_clean_error(self):
+        code, _, err = run("status", "--data-dir", f"{self.dir}/does-not-exist")
+        self.assertEqual(code, 2)
+        self.assertIn("does-not-exist", err)
+
     def test_status_refuses_while_bot_holds_the_ledger(self):
         held = Ledger(f"{self.dir}/ledger.db")
         self.addCleanup(held.close)
@@ -2005,6 +2010,10 @@ def cmd_live(args) -> int:
 
 
 def _open_ledger(args) -> Ledger | None:
+    if not Path(args.data_dir).is_dir():
+        print(f"error: data directory {args.data_dir} does not exist (set --data-dir or DATA_DIR)",
+              file=sys.stderr)
+        return None
     try:
         return Ledger(str(Path(args.data_dir) / "ledger.db"))
     except LedgerLocked:
@@ -2221,7 +2230,7 @@ __pycache__
 ```
 
 Replace the whole of `README.md`:
-```markdown
+~~~~markdown
 # fxbot
 
 An autonomous forex trading bot for OANDA, built to run unattended on Railway.
@@ -2259,10 +2268,10 @@ Requires Python 3.12; no third-party packages.
 - [Design spec](docs/superpowers/specs/2026-11-02-forex-bot-design.md): strategy, risk rules,
   safety behaviour and the gates to real money.
 - [Implementation plans](docs/superpowers/plans/): how each part was built and reviewed.
-```
+~~~~
 
 `docs/setup.md`:
-```markdown
+~~~~markdown
 # Setup checklist
 
 Follow these steps in order. Everything here uses the OANDA **practice (demo) account**. Real money
@@ -2356,7 +2365,7 @@ real slippage with the backtest. There must be zero unresolved-order or missing-
 
 Only after Gates A to C pass: work through the Gate D checklist in the spec, create a separate live
 API token, and then you, not the bot, set `OANDA_ENV=live` and `LIVE_TRADING_CONFIRMED=yes`.
-```
+~~~~
 
 ```bash
 printf 'data/\n' >> .gitignore
