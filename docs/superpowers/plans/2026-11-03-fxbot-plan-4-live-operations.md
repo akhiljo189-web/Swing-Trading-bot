@@ -2434,6 +2434,9 @@ fixing; 22 new mutations each fail the suite.
 - **Blocked-entries alert:** the timer runs while entries are blocked for any unexpected reason, even
   if the reason changes; it ignores late cycles; user/flatten/startup pauses and the daily loss
   limit reset it; it resets while the market is closed, so the weekend never triggers it.
+- **Only chosen or expected blocks are excluded from that alert** (`EXPECTED_BLOCKS`: user pause,
+  `/flatten` pause, `TRADING_ENABLED` pause, daily loss limit) — the engine's own
+  "paused: untagged trade or order on the account" still alerts after an hour (third review round).
 - **Entry deadline re-checked before each order** using the wall clock (`Engine.clock`, set by the
   live command), so slow reads cannot push an order past close + 90 s.
 - **Telegram wording:** the `/flatten` prompt says it also pauses; commands ignored as too old get a

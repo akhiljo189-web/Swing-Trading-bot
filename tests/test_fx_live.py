@@ -185,6 +185,12 @@ class RunnerTests(unittest.TestCase):
             self.runner._watch_blocks(reason, NOW + timedelta(hours=2))
         self.assertFalse(any("No new trades" in m for m in self.log.messages))
 
+    def test_untagged_trade_pause_still_alerts(self):
+        reason = "paused: untagged trade or order on the account"
+        self.runner._watch_blocks(reason, NOW)
+        self.runner._watch_blocks(reason, NOW + timedelta(hours=1))
+        self.assertTrue(any("No new trades for over an hour" in m for m in self.log.messages))
+
     def test_changing_block_reasons_still_alert(self):
         reasons = ["stale candles EUR_USD", "broker unavailable"] * 4
         for i, reason in enumerate(reasons):

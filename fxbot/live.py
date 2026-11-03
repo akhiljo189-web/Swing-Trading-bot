@@ -31,6 +31,8 @@ DELAY = timedelta(seconds=10)
 ENTRY_DEADLINE = timedelta(seconds=90)      # later than this after a close: no new entries
 BLOCKED_ALERT_AFTER = timedelta(hours=1)
 TELEGRAM_FAILURES_ALERT = 30                # consecutive failed polls (about 5 minutes)
+EXPECTED_BLOCKS = ("paused by user", "paused: /flatten requested", "paused: TRADING_ENABLED",
+                   "daily loss limit reached")   # chosen or expected: no "silent stop" alert
 
 
 class ConfigError(Exception):
@@ -146,7 +148,8 @@ class LiveRunner:
                 self.done_close, self.retry_at = close, None
             if report is not None:
                 self._safe(lambda: self._notify(report))
-                self._watch_blocks(report.blocked, now)
+                late = any(r.startswith("late cycle") for _, r in report.rejected)
+                self._watch_blocks(report.blocked or ("late cycle" if late else None), now)
         if self.broker is not None and getattr(self.broker, "auth_failed", False):
             if not self.ledger.halt_reason():
                 self.ledger.halt("halted: OANDA rejected the credentials")
@@ -181,7 +184,7 @@ class LiveRunner:
         """
         if reason is not None and reason.startswith("late cycle"):
             return
-        if reason is None or reason.startswith(("paused", "daily loss limit")):
+        if reason is None or reason.startswith(EXPECTED_BLOCKS):
             self.block_since = None
             return
         if self.block_since is None:
