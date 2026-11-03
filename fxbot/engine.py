@@ -309,3 +309,34 @@ class Engine:
                                           filled.notional_gbp))
             entries = {**entries, sig.pair: entries.get(sig.pair, 0) + 1}
             margin_used += filled.notional_gbp * c.margin_rate
+
+    # --- Friday flatten and /flatten (spec §7) ------------------------------
+    def flatten(self, now: datetime) -> int:
+        """Close every bot trade. Returns how many remain open (call again until 0)."""
+        try:
+            bot_trades = [t for t in self.broker.open_trades() if is_bot(t.client_id)]
+        except BrokerError as exc:
+            self.alert("warning", f"flatten: broker unavailable: {exc}")
+            remaining = len(self.ledger.open_positions())
+        else:
+            remaining = 0
+            for t in bot_trades:
+                try:
+                    ok = self.broker.close_trade(t.trade_id)
+                except BrokerError:
+                    ok = False
+                if not ok:
+                    remaining += 1
+            self.ledger.record(now, None, "flatten", f"{len(bot_trades) - remaining} closed, {remaining} open")
+        if remaining and weekend_phase(now, self.s) == "deadline":
+            self.alert("critical", f"{remaining} bot trade(s) still open after Friday 20:00 - "
+                       "close them in the OANDA app")
+        return remaining
+
+
+def weekend_phase(now: datetime, settings: Settings) -> str:
+    """'normal', 'flatten' (Friday from 19:30 London) or 'deadline' (Friday from 20:00)."""
+    local = now.astimezone(LONDON)
+    if local.weekday() != 4 or local.time() < settings.friday_flatten_start:
+        return "normal"
+    return "deadline" if local.time() >= settings.friday_flatten_deadline else "flatten"
