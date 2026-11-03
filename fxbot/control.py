@@ -39,6 +39,7 @@ class Control:
             sent = message.get("date")
             if sent is not None and now - datetime.fromtimestamp(sent, timezone.utc) > CONFIRM_WINDOW:
                 self.ledger.record(now, None, "command", f"ignored old message: {text[:60]}")
+                self._reply(f"Ignored '{text[:40]}': sent more than 2 minutes ago. Please resend it.")
                 continue   # never act on commands queued while the bot was down
             self.ledger.record(now, None, "command", text[:100])
             self.handle(text, now)
@@ -54,7 +55,7 @@ class Control:
         elif command in ("/resume", "/flatten"):
             self.ledger.set("pending_command", command)
             self.ledger.set("pending_until", (now + CONFIRM_WINDOW).isoformat())
-            action = "resume trading" if command == "/resume" else "close ALL bot trades"
+            action = "resume trading" if command == "/resume" else "close ALL bot trades and pause new trades"
             self._reply(f"Reply YES within 2 minutes to {action}.")
         elif command == "yes":
             pending, until = self.ledger.get("pending_command"), self.ledger.get("pending_until")

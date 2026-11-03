@@ -133,6 +133,7 @@ def cmd_live(args) -> int:
     broker = OandaBroker(cfg.token, cfg.account_id, cfg.environment)
     settings = Settings()
     engine = Engine(broker, ledger, settings, LiveNewsFeed(), alerter)
+    engine.clock = clock
     def status() -> str:
         try:
             nav = broker.account().nav

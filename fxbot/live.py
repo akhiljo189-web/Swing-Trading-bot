@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fxbot.alerts import Alerter, Healthcheck
-from fxbot.broker import is_bot
+from fxbot.broker import BrokerError, is_bot
 from fxbot.config import Settings
 from fxbot.control import Control
 from fxbot.engine import Engine, weekend_phase
@@ -108,7 +108,6 @@ class LiveRunner:
         self.last_poll = self.last_ping = self.last_flatten = None
         self.reported_closed = {p.client_id for p in ledger.all_positions() if p.status == "closed"}
         self.summary_day = None
-        self.block_reason: str | None = None
         self.block_since: datetime | None = None
         self.telegram_failures = 0
 
@@ -128,6 +127,7 @@ class LiveRunner:
             self._safe(self.health.ping)
         self._safe(lambda: self._daily_summary(now))
         if not market_open(now):
+            self.block_since = None   # the weekend is not a silent stop
             return
         flatten_requested = self.ledger.get("flatten_requested") is not None
         if (flatten_requested or weekend_phase(now, self.s) != "normal") and \
@@ -137,7 +137,8 @@ class LiveRunner:
         close = self._close_time(now)
         if now >= close + DELAY and self.done_close != close and (self.retry_at is None or now >= self.retry_at):
             on_time = now - close <= ENTRY_DEADLINE
-            report = self._guard(lambda: self.engine.run_cycle(now, allow_entries=on_time), now)
+            report = self._guard(lambda: self.engine.run_cycle(now, allow_entries=on_time,
+                                                               entry_deadline=close + ENTRY_DEADLINE), now)
             late = report is not None and (report.blocked or "").startswith("stale candles")
             if late and now < close + DELAY + timedelta(seconds=60):
                 self.retry_at = now + timedelta(seconds=10)
@@ -173,19 +174,28 @@ class LiveRunner:
             self.telegram_failures = 0
 
     def _watch_blocks(self, reason: str | None, now: datetime) -> None:
-        """Alert if new entries stay blocked for over an hour (a silent stop is the worst failure)."""
-        if not reason or reason.startswith(("paused by user", "late cycle")):
-            self.block_reason = self.block_since = None
+        """Alert if new entries stay blocked for over an hour (a silent stop is the worst failure).
+
+        The timer runs while entries are blocked for any unexpected reason, even if the reason
+        changes. Pauses the user chose and the daily loss limit are expected, so they reset it.
+        """
+        if reason is not None and reason.startswith("late cycle"):
             return
-        if reason != self.block_reason:
-            self.block_reason, self.block_since = reason, now
+        if reason is None or reason.startswith(("paused", "daily loss limit")):
+            self.block_since = None
+            return
+        if self.block_since is None:
+            self.block_since = now
         elif now - self.block_since >= BLOCKED_ALERT_AFTER:
             self.alerter("warning", f"No new trades for over an hour: {reason}")
 
     def _flatten(self, now: datetime, requested: bool) -> None:
         remaining = self.engine.flatten(now)
         if remaining == 0 and self.broker is not None:   # trust the broker's list, not the replies
-            remaining = sum(1 for t in self.broker.open_trades() if is_bot(t.client_id))
+            try:
+                remaining = sum(1 for t in self.broker.open_trades() if is_bot(t.client_id))
+            except BrokerError:
+                remaining = 1                              # unknown: check again in 60 s, no halt
         if requested and remaining == 0:
             self.ledger.set("flatten_requested", None)
             self.alerter.info("Flatten complete: no bot trades open.")

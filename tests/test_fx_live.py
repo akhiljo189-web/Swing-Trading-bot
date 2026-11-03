@@ -167,6 +167,36 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(any("No new trades for over an hour" in m and "news feed unavailable" in m
                             for m in self.log.messages))
 
+    def test_transient_read_error_during_flatten_does_not_halt(self):
+        friday = datetime(2026, 11, 6, 19, 45, 10, tzinfo=UTC)
+        self.h.sim.now = friday
+        self.h.sim.add_trade("EUR_USD", 1000, 1.1, "fxb-x", 1.099)
+        self.h.ledger.set("flatten_requested", friday.isoformat())
+        self.h.engine.flatten = lambda now: 0
+        self.h.sim.fail_next = {"open_trades"}
+        self.runner._flatten(friday, True)
+        self.assertIsNone(self.h.ledger.halt_reason())
+        self.assertIsNotNone(self.h.ledger.get("flatten_requested"))       # retried next time
+
+    def test_chosen_pauses_and_daily_limit_do_not_nag(self):
+        for reason in ("paused: /flatten requested", "paused: TRADING_ENABLED=false at startup",
+                       "daily loss limit reached"):
+            self.runner._watch_blocks(reason, NOW)
+            self.runner._watch_blocks(reason, NOW + timedelta(hours=2))
+        self.assertFalse(any("No new trades" in m for m in self.log.messages))
+
+    def test_changing_block_reasons_still_alert(self):
+        reasons = ["stale candles EUR_USD", "broker unavailable"] * 4
+        for i, reason in enumerate(reasons):
+            self.runner._watch_blocks(reason, NOW + timedelta(minutes=15 * i))
+        self.assertTrue(any("No new trades for over an hour" in m for m in self.log.messages))
+
+    def test_block_timer_restarts_after_the_weekend(self):
+        self.runner._watch_blocks("news feed unavailable", datetime(2026, 11, 6, 21, 30, tzinfo=UTC))
+        self.step(datetime(2026, 11, 7, 12, tzinfo=UTC))                    # market closed
+        self.runner._watch_blocks("news feed unavailable", datetime(2026, 11, 8, 22, 15, tzinfo=UTC))
+        self.assertFalse(any("No new trades" in m for m in self.log.messages))
+
     def test_failing_parts_never_stop_the_loop(self):
         class Boom:
             def poll(self, now):

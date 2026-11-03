@@ -517,6 +517,15 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(rep.blocked, "late cycle: no catch-up entries")
         self.assertEqual(h.sim.orders_sent, [])
 
+    def test_entry_deadline_rechecked_before_sending(self):
+        h = Harness(self)
+        set_market(h.sim, "EUR_USD", breakout=+1)
+        h.engine.clock = lambda: NOW + timedelta(minutes=5)             # slow reads ate the window
+        h.sim.now = NOW
+        rep = h.engine.run_cycle(NOW, entry_deadline=NOW + timedelta(seconds=80))
+        self.assertEqual(h.sim.orders_sent, [])
+        self.assertIn(("EUR_USD", "late cycle: no catch-up entries"), rep.rejected)
+
     def test_deposit_racing_the_snapshot_is_not_a_loss(self):
         h = Harness(self)
         h.cycle()                                             # ledger initialised on day 1

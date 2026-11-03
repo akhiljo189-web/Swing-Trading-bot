@@ -42,6 +42,8 @@ class Engine:
         """`signal_fn` defaults to the strategy; backtests pass baselines or a cached wrapper."""
         self.broker, self.ledger, self.s, self.news, self._alert_fn = broker, ledger, settings, news, alert
         self.signal_fn = signal_fn
+        self.clock = None              # wall clock (live only): re-checks the entry deadline
+        self._entry_deadline = None
 
     # --- helpers -----------------------------------------------------------
     def alert(self, level: str, text: str) -> None:
@@ -153,9 +155,14 @@ class Engine:
                 self.alert("warning", f"trade {p.trade_id} closed without a transaction; P&L unknown")
 
     # --- the cycle ---------------------------------------------------------
-    def run_cycle(self, now: datetime, allow_entries: bool = True) -> CycleReport:
-        """One cycle. allow_entries=False (a late cycle) reconciles and protects but never enters."""
+    def run_cycle(self, now: datetime, allow_entries: bool = True,
+                  entry_deadline: datetime | None = None) -> CycleReport:
+        """One cycle. allow_entries=False (a late cycle) reconciles and protects but never enters.
+
+        With a wall clock set, no order is sent once `entry_deadline` has passed (slow reads).
+        """
         rep, s, ledger = CycleReport(now), self.s, self.ledger
+        self._entry_deadline = entry_deadline
         blocks: list[str] = []
 
         def block(reason: str) -> None:
@@ -330,6 +337,9 @@ class Engine:
                                  blocks[0] if blocks else None)
             decision = approve(c, state, s)
             cid = client_id(sig.pair, sig.side, sig.candle_time)
+            if decision.approved and self.clock and self._entry_deadline and self.clock() > self._entry_deadline:
+                blocks.append("late cycle: no catch-up entries")
+                decision = type(decision)(False, "late cycle: no catch-up entries")
             if decision.approved and ledger.has_client_id(cid):
                 decision = type(decision)(False, "duplicate signal")
             if not decision.approved:

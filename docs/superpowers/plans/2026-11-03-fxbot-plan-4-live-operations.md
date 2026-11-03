@@ -2428,3 +2428,17 @@ fixing; 22 new mutations each fail the suite.
   stop the pings so the dead-man's switch fires; holiday early closes are not flattened (spec covers
   Fridays only); no `flatten` CLI command (the bot holds the ledger while running; use `/flatten`).
 
+### Second review round (re-review of the fixes)
+- **A transient read error while confirming a flatten no longer halts the bot:** the broker check
+  treats `BrokerError` as "still unknown" and retries 60 s later.
+- **Blocked-entries alert:** the timer runs while entries are blocked for any unexpected reason, even
+  if the reason changes; it ignores late cycles; user/flatten/startup pauses and the daily loss
+  limit reset it; it resets while the market is closed, so the weekend never triggers it.
+- **Entry deadline re-checked before each order** using the wall clock (`Engine.clock`, set by the
+  live command), so slow reads cannot push an order past close + 90 s.
+- **Telegram wording:** the `/flatten` prompt says it also pauses; commands ignored as too old get a
+  "please resend" reply.
+- Accepted: the Telegram-outage warning is itself sent over Telegram (it arrives when only polling
+  fails, e.g. a webhook conflict); worst-case cycle latency with every read on its third attempt is
+  ~9 minutes, inside the 10-minute healthcheck grace.
+

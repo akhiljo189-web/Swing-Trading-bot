@@ -46,6 +46,7 @@ class ControlTests(unittest.TestCase):
 
     def test_flatten_sets_request_after_confirmation(self):
         self.say("/flatten")
+        self.assertIn("pause", self.tg.sent[-1])
         self.assertIsNone(self.ledger.get("flatten_requested"))
         self.say("YES")
         self.assertIsNotNone(self.ledger.get("flatten_requested"))
@@ -59,6 +60,7 @@ class ControlTests(unittest.TestCase):
     def test_old_messages_are_never_replayed(self):
         self.say("/pause", sent=NOW - timedelta(hours=5))
         self.assertIsNone(self.ledger.pause_reason())
+        self.assertIn("resend", self.tg.sent[-1])
 
     def test_command_with_bot_name(self):
         self.say("/status@fxbot_helper_bot")
