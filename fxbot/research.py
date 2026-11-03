@@ -128,9 +128,12 @@ def no_skill(history, plan, news, base, runs: int, processes: int | None) -> lis
     methods = multiprocessing.get_all_start_methods()
     context = multiprocessing.get_context("fork" if "fork" in methods else None)
     gc.freeze()   # keep forked workers from copying the shared history pages
-    with ProcessPoolExecutor(processes, mp_context=context, initializer=_init_worker,
-                             initargs=(history, plan, news, base)) as pool:
-        return list(pool.map(_no_skill_run, range(runs), chunksize=8))
+    try:
+        with ProcessPoolExecutor(processes, mp_context=context, initializer=_init_worker,
+                                 initargs=(history, plan, news, base)) as pool:
+            return list(pool.map(_no_skill_run, range(runs), chunksize=8))
+    finally:
+        gc.unfreeze()
 
 
 # --- Gate B and report -------------------------------------------------------------
@@ -214,6 +217,7 @@ def write_report(report: dict, out_dir: Path) -> tuple[Path, Path]:
         f"- Expectancy: {wf['expectancy_r']:.3f} R (95% CI by trading day: {wf['expectancy_r_ci95']})",
         f"- Net: £{wf['net_gbp']:.2f}; profit factor: {wf['profit_factor']}",
         f"- Max drawdown: {wf['max_drawdown']:.1%}; worst losing streak: {wf['worst_losing_streak']}",
+        f"- Trades left open at the end (P&L in NAV but not in trade stats): {wf['open_at_end']}",
         "", "## Slippage sensitivity (walk-forward settings)", "", "| Pips per side | Trades | Expectancy R |",
         "|---|---|---|",
         *[f"| {k} | {v['trades']} | {v['expectancy_r']:.3f} |" for k, v in report["slippage_sensitivity"].items()],

@@ -1853,12 +1853,17 @@ Each finding was reproduced with a failing test before fixing; 9 new mutations e
 - **Smaller fixes:** trades still open at the end of a run are closed and counted; signals are
   evaluated for every pair every cycle (complete no-skill base); AUD_USD margin 5% (not an ESMA
   major); `add_months` clamps month-end days; `History.coverage_problems()` and a CLI check refuse
-  data that does not cover the period (with 35 days of warm-up); CLI rejects non-positive numbers
+  data that does not cover the period (with 42 days of warm-up); CLI rejects non-positive numbers
   and reports load errors without tracebacks; `fork` only where available, `gc.freeze()` before
   the pool; `slots=True` on `Candle` and `HistCandle` (less memory on multi-year data);
   `multi_trade_days_all_lost_if_independent` added as the clustering baseline; `research.md` now
   includes baselines, variants, per-pair and per-year tables and caveats; `run(skip_idle=False)`
   added with a test proving skipping idle cycles changes nothing.
+- **Re-review follow-ups:** trades open at the end of a window close at the last decision time
+  (not 30 minutes later), falling back to the last completed close with double slippage when no
+  price exists (holiday or data end), and the NAV after that close is the last drawdown mark;
+  `gc.freeze()` is undone after the pool; warm-up coverage check widened to 42 days; the report
+  shows trades left open at the end.
 - **Run time (for planning real runs):** about 1.5 s per simulated month per run on this machine.
   1,000 no-skill runs over 8 years out of sample is roughly 40 CPU-hours (spread over the
   available processes); walk-forward training runs serially. Use `--no-skill-runs` for quicker

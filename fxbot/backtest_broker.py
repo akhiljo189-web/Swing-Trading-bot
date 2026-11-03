@@ -157,6 +157,13 @@ class BacktestBroker:
             if tp is not None and c.ask_l <= tp:
                 return self._close(t, tp, at, "target")
 
+    def close_at_last_price(self, trade_id: str) -> None:
+        """Backtest end only: close at the last completed close with double slippage."""
+        t = self.trades[trade_id]
+        c = self._last(t.pair, self.now)
+        slip = 2 * self._slip(t.pair)
+        self._close(t, c.bid_c - slip if t.units > 0 else c.ask_c + slip, self.now, "market")
+
     # --- Broker interface ----------------------------------------------------
     def account(self) -> Account:
         unrealized = margin = 0.0

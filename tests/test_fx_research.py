@@ -166,11 +166,11 @@ class ResearchEndToEndTests(unittest.TestCase):
                                    "--end", "2026-02-01"]), 2)              # no data files
 
     def test_coverage_problems(self):
-        h = make_history(40)
-        self.assertEqual(h.coverage_problems(S.pairs, START + timedelta(days=35), START + timedelta(days=39)), [])
+        h = make_history(50)
+        self.assertEqual(h.coverage_problems(S.pairs, START + timedelta(days=42), START + timedelta(days=48)), [])
         no_warmup = h.coverage_problems(S.pairs, START, START + timedelta(days=38))
         self.assertTrue(no_warmup and all("warm-up" in p for p in no_warmup))
-        too_late = h.coverage_problems(S.pairs, START + timedelta(days=35), START + timedelta(days=60))
+        too_late = h.coverage_problems(S.pairs, START + timedelta(days=42), START + timedelta(days=60))
         self.assertTrue(too_late and all("ends" in p for p in too_late))
 
     def test_parallel_no_skill_matches_serial(self):
@@ -181,6 +181,8 @@ class ResearchEndToEndTests(unittest.TestCase):
         serial = research.no_skill(h, plan, None, base, 4, processes=1)
         parallel = research.no_skill(h, plan, None, base, 4, processes=2)
         self.assertEqual(serial, parallel)
+        import gc
+        self.assertEqual(gc.get_freeze_count(), 0)          # parent process left as it was
 
 
 if __name__ == "__main__":

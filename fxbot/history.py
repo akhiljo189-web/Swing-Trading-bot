@@ -99,7 +99,7 @@ class History:
         return self.series.get((pair, granularity))
 
     def coverage_problems(self, pairs: tuple[str, ...], start: datetime, end: datetime,
-                          warmup: timedelta = timedelta(days=35), slack: timedelta = timedelta(days=4)) -> list[str]:
+                          warmup: timedelta = timedelta(days=42), slack: timedelta = timedelta(days=4)) -> list[str]:
         """Human-readable reasons the data cannot support a backtest of [start, end)."""
         problems = []
         for pair in pairs:

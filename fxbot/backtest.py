@@ -99,11 +99,11 @@ def run(history: History, settings: Settings, start: datetime, end: datetime, *,
             if broker.trades or any(signals) or not skip_idle:
                 engine.run_cycle(now)
             marks.append(broker.account().nav)
-        if times:   # close what is still open so every trade is counted
-            final = times[-1] + 2 * M15 + DELAY
-            broker.advance(final)
+        if broker.trades:   # close at the last decision time so every trade is counted
             for trade_id in list(broker.trades):
-                broker.close_trade(trade_id)
+                if not broker.close_trade(trade_id):          # no price at the window end
+                    broker.close_at_last_price(trade_id)
+            marks.append(broker.account().nav)
         risk = {p.trade_id: (p.risk_gbp or 0.0) for p in ledger.all_positions() if p.trade_id}
         decisions = ledger.decisions()
         halted = ledger.halt_reason()

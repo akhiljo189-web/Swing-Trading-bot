@@ -73,10 +73,21 @@ class BacktestRunTests(unittest.TestCase):
 
     def test_trades_open_at_the_end_are_closed_and_counted(self):
         t = self.result.trades[5]
-        r = run(HISTORY, S, BEGIN, t.open_time + timedelta(minutes=20))
+        end = t.open_time + timedelta(minutes=20)
+        r = run(HISTORY, S, BEGIN, end)
         self.assertEqual(r.open_at_end, 0)
         self.assertAlmostEqual(r.end_nav - r.start_nav, sum(x.pl_gbp for x in r.trades), places=6)
         self.assertIn(t.pair, [x.pair for x in r.trades if x.reason == "market"])
+        self.assertTrue(all(x.close_time <= end + timedelta(minutes=15, seconds=10) for x in r.trades))
+        self.assertAlmostEqual(r.nav_marks[-1], r.end_nav, places=9)        # drawdown sees the close
+
+    def test_trades_open_when_the_data_ends_are_still_closed(self):
+        t = self.result.trades[5]
+        cut = t.open_time + timedelta(minutes=20)
+        truncated = History({k: [c for c in s.candles if c.time < cut] for k, s in HISTORY.series.items()})
+        r = run(truncated, S, BEGIN, cut)
+        self.assertEqual(r.open_at_end, 0)
+        self.assertAlmostEqual(r.end_nav - r.start_nav, sum(x.pl_gbp for x in r.trades), places=6)
 
     def test_signals_recorded_for_every_pair(self):
         times = {key[1] for key in self.result.signals}
@@ -84,8 +95,9 @@ class BacktestRunTests(unittest.TestCase):
             self.assertEqual({p for p, t in self.result.signals if t == when}, set(S.pairs))
 
     def test_nav_marks_every_cycle(self):
-        self.assertEqual(len(self.result.nav_marks),
-                         len([t for t in HISTORY.get("EUR_USD", "M15").times if BEGIN <= t < END]))
+        cycles = len([t for t in HISTORY.get("EUR_USD", "M15").times if BEGIN <= t < END])
+        self.assertIn(len(self.result.nav_marks), (cycles, cycles + 1))   # +1 after an end-of-run close
+        self.assertAlmostEqual(self.result.nav_marks[-1], self.result.end_nav, places=9)
 
     def test_no_lookahead(self):
         """Removing all data after a cut-off must not change any trade closed before it."""
