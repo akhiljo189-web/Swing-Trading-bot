@@ -1836,7 +1836,36 @@ git commit -m "fxbot: add research report, Gate B checks and backtest CLI"
 - **Verification before publishing:** all code was run in a scratch copy (suite OK in ~25 s). 16 deliberate mutations (stop-first rule, gap fills, stop slippage, double-slippage fallback, entry price source, completed-candle visibility, short stops on ask, JPY conversion, Friday flatten, cycles while trades are open, day-block bootstrap, drawdown peak, Gate B drawdown and slippage checks, walk-forward selection, breakout-first equivalence) each make the suite fail.
 - **Placeholders:** none. **Type consistency:** interfaces above match the code blocks.
 
+## Amendments after the Plan 3 code review (implemented; code in the repo supersedes the blocks above)
+
+Each finding was reproduced with a failing test before fixing; 9 new mutations each fail the suite.
+
+- **Gate B compared mismatched settings (bias toward passing):** the trend baseline, the no-skill
+  runs, slippage sensitivity, time-exit-off and news-off variants now all run over the same
+  walk-forward windows with each window's chosen settings (`chain(..., signal_fn=...)`;
+  `no_skill(history, plan, news, base, runs, processes)` uses the walk-forward run's signals).
+  The fixed-default-parameter run is kept as an informational extra (`fixed_params`).
+- **A single missing M15 candle halted a whole run:** executions use the next candle when the
+  decision candle has no data (double slippage); with no price within 30 minutes an entry is
+  rejected (`NO_PRICE`) and an exit is retried later — never a halt.
+- **Drawdown was understated:** `BacktestResult.daily_nav` is replaced by `nav_marks` (NAV after
+  every replayed M15 close) and `max_drawdown(marks, start_nav)` starts its peak at the start NAV.
+- **Smaller fixes:** trades still open at the end of a run are closed and counted; signals are
+  evaluated for every pair every cycle (complete no-skill base); AUD_USD margin 5% (not an ESMA
+  major); `add_months` clamps month-end days; `History.coverage_problems()` and a CLI check refuse
+  data that does not cover the period (with 35 days of warm-up); CLI rejects non-positive numbers
+  and reports load errors without tracebacks; `fork` only where available, `gc.freeze()` before
+  the pool; `slots=True` on `Candle` and `HistCandle` (less memory on multi-year data);
+  `multi_trade_days_all_lost_if_independent` added as the clustering baseline; `research.md` now
+  includes baselines, variants, per-pair and per-year tables and caveats; `run(skip_idle=False)`
+  added with a test proving skipping idle cycles changes nothing.
+- **Run time (for planning real runs):** about 1.5 s per simulated month per run on this machine.
+  1,000 no-skill runs over 8 years out of sample is roughly 40 CPU-hours (spread over the
+  available processes); walk-forward training runs serially. Use `--no-skill-runs` for quicker
+  exploratory reports and the full 1,000 for the Gate B decision.
+
 ### Carried forward to Plan 4
 - `OandaBroker.candles()` must request `BA` candles and derive mids as (bid + ask) / 2 per field.
 - `fetch-data` command: download H1 and M15 bid/ask history for the five pairs into `<PAIR>_<GRAN>.csv`, and add an S10 lookup (cached on disk) wired into the backtest command as `--s10`.
-- Document in the setup checklist that the report needs several years of data (OANDA history) and a historical high-impact calendar CSV for the news filter.
+- Document in the setup checklist that the report needs several years of data (OANDA history) and a historical high-impact calendar CSV (scheduled releases only) for the news filter.
+- `fetch-data` must skip incomplete candles (`complete=false`) and print a gap report (missing M15 candles per pair per month).

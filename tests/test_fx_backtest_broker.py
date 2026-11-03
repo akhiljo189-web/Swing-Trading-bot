@@ -73,6 +73,36 @@ class ExecutionTests(unittest.TestCase):
             b.factor("EUR_CHF", b.now)
 
 
+class ReviewExecutionTests(unittest.TestCase):
+    def test_missing_execution_candle_uses_next_candle(self):
+        eur = [x for x in EUR if x.time != at(15)]               # no ticks 09:15-09:30
+        b = broker(eur)
+        b.advance(at(15) + timedelta(seconds=10))
+        r = b.market_order("EUR_USD", 1000, "fxb-1", 0.0010, 2.0)
+        self.assertAlmostEqual(r.fill_price, 1.1001 + SPREAD + 2 * SLIP, places=10)   # 09:30 open
+
+    def test_no_price_nearby_rejects_instead_of_raising(self):
+        eur = [x for x in EUR if x.time not in (at(15), at(30))]
+        b = broker(eur)
+        b.advance(at(15) + timedelta(seconds=10))
+        r = b.market_order("EUR_USD", 1000, "fxb-1", 0.0010, 2.0)
+        self.assertEqual((r.status, r.reason), ("rejected", "NO_PRICE"))
+        self.assertEqual(b.txns[-1].kind, "REJECT")
+
+    def test_close_without_price_returns_false(self):
+        b = broker(EUR[:2])                                       # data ends after the entry candle
+        b.advance(at(15) + timedelta(seconds=10))
+        r = b.market_order("EUR_USD", 1000, "fxb-1", 0.0010, 2.0)
+        b.advance(at(45) + timedelta(seconds=10))
+        self.assertFalse(b.close_trade(r.trade_id))
+        self.assertIn(r.trade_id, b.trades)
+
+    def test_margin_rates_follow_uk_rules(self):
+        b = broker(EUR)
+        self.assertAlmostEqual(b.instrument("EUR_USD").margin_rate, 1 / 30)
+        self.assertAlmostEqual(b.instrument("AUD_USD").margin_rate, 0.05)   # AUD is not an ESMA major
+
+
 class ExitTests(unittest.TestCase):
     def open_long(self, eur, stop_distance=0.0010):
         b = broker(eur)
@@ -120,6 +150,28 @@ class ExitTests(unittest.TestCase):
         b.advance(at(45) + timedelta(seconds=10))
         self.assertEqual(b.closed[0].reason, "stop")
         self.assertAlmostEqual(b.closed[0].exit, r.stop_price + SLIP, places=10)
+
+    def test_short_gap_and_short_target(self):
+        gap = EUR[:2] + [c(30, 1.1020, 1.1025, 1.1015, 1.1020)] + EUR[3:]      # ask opens 1.1022
+        b = broker(gap)
+        b.advance(at(15) + timedelta(seconds=10))
+        b.market_order("EUR_USD", -1000, "fxb-1", 0.0010, 0.5)
+        b.advance(at(45) + timedelta(seconds=10))
+        self.assertEqual(b.closed[0].reason, "gap")
+        self.assertAlmostEqual(b.closed[0].exit, 1.1022 + SLIP, places=10)
+        win = EUR[:2] + [c(30, 1.1000, 1.1001, 1.0960, 1.0970)] + EUR[3:]      # ask low 1.0962
+        b = broker(win)
+        b.advance(at(15) + timedelta(seconds=10))
+        r = b.market_order("EUR_USD", -1000, "fxb-2", 0.0010, 0.5)
+        b.set_take_profit(r.trade_id, 1.0970)
+        b.advance(at(45) + timedelta(seconds=10))
+        self.assertEqual((b.closed[0].reason, b.closed[0].exit), ("target", 1.0970))
+
+    def test_entry_candle_is_never_treated_as_a_gap(self):
+        b, r = self.open_long(EUR, stop_distance=0.0001)          # stop above the entry candle's bid open
+        b.advance(at(30) + timedelta(seconds=10))
+        self.assertEqual(b.closed[0].reason, "stop")
+        self.assertAlmostEqual(b.closed[0].exit, r.stop_price - SLIP, places=10)
 
     def test_no_exit_before_candle_completes(self):
         eur = EUR[:2] + [c(30, 1.1001, 1.1002, 1.0990, 1.0992)] + EUR[3:]

@@ -3,7 +3,9 @@
 Execution model (all deliberately conservative):
 - Market orders (entries, time exits, flattening) execute 10 s after the decision candle closes:
   at the S10 candle open covering that moment if available, else at the next M15 open with
-  DOUBLE slippage. Buys pay ask + slippage, sells receive bid - slippage.
+  DOUBLE slippage. Buys pay ask + slippage, sells receive bid - slippage. If that M15 candle is
+  missing (no ticks), the following one is used; with no price within 30 minutes the order is
+  rejected (entries) or retried later (exits) instead of failing.
 - Stops are checked on bid (longs) / ask (shorts) M15 highs and lows. If a candle (other than the
   entry candle) opens beyond the stop, the exit is that open price (gap). Stop exits pay slippage.
 - Take-profits fill exactly at their price. If stop and target are both touched in one candle,
@@ -40,8 +42,10 @@ class ClosedTrade:
     reason: str   # stop | gap | target | market
 
 
+MAJORS = {"USD", "EUR", "JPY", "GBP", "CAD", "CHF"}   # ESMA major currencies
+
+
 class BacktestBroker:
-    margin_rate = 1 / 30   # UK retail leverage on majors
 
     def __init__(self, history: History, settings: Settings, nav: float, s10: S10Lookup | None = None):
         self.h, self.s, self.balance, self.s10 = history, settings, nav, s10
@@ -90,18 +94,19 @@ class BacktestBroker:
         n = self.now
         return n.replace(minute=n.minute - n.minute % 15, second=0, microsecond=0)
 
-    def _execute(self, pair: str, buy: bool) -> tuple[float, datetime]:
+    def _execute(self, pair: str, buy: bool) -> tuple[float, datetime, datetime] | None:
+        """(price, fill time, candle open the fill belongs to), or None if no price is near."""
         t = self._decision_close()
         quote = self.s10(pair, t + timedelta(seconds=10)) if self.s10 else None
-        mult = 1
+        mult, candle_time = 1, t
         if quote is None:
             c = self._series(pair).at_or_after(t)
-            if c is None or c.time != t:
-                raise BrokerError(f"no price to execute {pair} at {t}")
-            quote, mult = (c.bid_o, c.ask_o), 2
+            if c is None or c.time - t > 2 * M15 - timedelta(seconds=1):   # nothing within 30 min
+                return None
+            quote, mult, candle_time = (c.bid_o, c.ask_o), 2, c.time
         bid, ask = quote
         slip = mult * self._slip(pair)
-        return (ask + slip if buy else bid - slip), t + timedelta(seconds=10)
+        return (ask + slip if buy else bid - slip), max(t, candle_time) + timedelta(seconds=10), candle_time
 
     def _txn(self, kind: str, at: datetime, **fields) -> Txn:
         txn = Txn(len(self.txns) + 1, kind, at, **fields)
@@ -160,7 +165,7 @@ class BacktestBroker:
             mark = c.bid_c if t.units > 0 else c.ask_c
             f = self.factor(t.pair, self.now)
             unrealized += t.units * (mark - t.open_price) * f
-            margin += abs(t.units) * mark * f * self.margin_rate
+            margin += abs(t.units) * mark * f * self.margin_rate(t.pair)
         return Account(self.balance + unrealized, margin, len(self.txns))
 
     def candles(self, pair: str, granularity: str, count: int) -> list[Candle]:
@@ -177,7 +182,12 @@ class BacktestBroker:
         return out
 
     def instrument(self, pair: str) -> InstrumentInfo:
-        return InstrumentInfo(self.margin_rate, 100_000_000)
+        return InstrumentInfo(self.margin_rate(pair), 100_000_000)
+
+    @staticmethod
+    def margin_rate(pair: str) -> float:
+        """UK retail margin: 1/30 for major pairs, 1/20 for other currency pairs."""
+        return 1 / 30 if set(currencies(pair)) <= MAJORS else 1 / 20
 
     def open_trades(self) -> list[Trade]:
         return list(self.trades.values())
@@ -190,7 +200,11 @@ class BacktestBroker:
 
     def market_order(self, pair: str, units: int, client_id: str, stop_distance: float,
                      price_bound: float) -> OrderResult:
-        fill, at = self._execute(pair, units > 0)
+        executed = self._execute(pair, units > 0)
+        if executed is None:
+            self._txn("REJECT", self.now, client_id=client_id, pair=pair)
+            return OrderResult("rejected", reason="NO_PRICE")
+        fill, at, candle_time = executed
         if (units > 0 and fill > price_bound) or (units < 0 and fill < price_bound):
             self._txn("REJECT", at, client_id=client_id, pair=pair)
             return OrderResult("rejected", reason="BOUNDS_VIOLATION")
@@ -198,7 +212,7 @@ class BacktestBroker:
         stop = fill - stop_distance if units > 0 else fill + stop_distance
         trade = Trade(str(self._ids), pair, units, fill, at, client_id, stop, None)
         self.trades[trade.trade_id] = trade
-        idx = bisect.bisect_left(self._series(pair).times, self._decision_close())
+        idx = bisect.bisect_left(self._series(pair).times, candle_time)
         self._entry_index[trade.trade_id] = self._next_index[trade.trade_id] = idx
         self._txn("FILL", at, client_id=client_id, trade_id=trade.trade_id, pair=pair, units=units, price=fill)
         return OrderResult("filled", trade.trade_id, fill, units, stop)
@@ -215,6 +229,9 @@ class BacktestBroker:
         t = self.trades.get(trade_id)
         if t is None:
             return False
-        price, at = self._execute(t.pair, t.units < 0)
+        executed = self._execute(t.pair, t.units < 0)
+        if executed is None:
+            return False
+        price, at, _ = executed
         self._close(t, price, at, "market")
         return True

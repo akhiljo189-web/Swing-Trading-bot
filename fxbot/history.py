@@ -17,7 +17,7 @@ FIELDS = ["time", "bid_o", "bid_h", "bid_l", "bid_c", "ask_o", "ask_h", "ask_l",
 DURATION = {"S10": timedelta(seconds=10), "M15": timedelta(minutes=15), "H1": timedelta(hours=1)}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class HistCandle:
     time: datetime
     bid_o: float
@@ -97,3 +97,20 @@ class History:
 
     def get(self, pair: str, granularity: str) -> Series | None:
         return self.series.get((pair, granularity))
+
+    def coverage_problems(self, pairs: tuple[str, ...], start: datetime, end: datetime,
+                          warmup: timedelta = timedelta(days=35), slack: timedelta = timedelta(days=4)) -> list[str]:
+        """Human-readable reasons the data cannot support a backtest of [start, end)."""
+        problems = []
+        for pair in pairs:
+            for g in ("H1", "M15"):
+                s = self.get(pair, g)
+                if s is None or not s.times:
+                    problems.append(f"{pair} {g}: no data")
+                    continue
+                if s.times[0] > start - warmup:
+                    problems.append(f"{pair} {g}: starts {s.times[0]:%Y-%m-%d}; need data from "
+                                    f"{start - warmup:%Y-%m-%d} for indicator warm-up")
+                if s.times[-1] < end - slack:
+                    problems.append(f"{pair} {g}: ends {s.times[-1]:%Y-%m-%d}, before {end:%Y-%m-%d}")
+        return problems

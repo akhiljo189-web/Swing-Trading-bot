@@ -25,7 +25,11 @@ def news_blocked(pair: str, at: datetime, events: Iterable[NewsEvent],
 
 
 def load_calendar(path: Path) -> list[NewsEvent]:
-    """Historical calendar CSV with header `time,currency,impact` (UTC ISO 8601 times)."""
+    """Historical calendar CSV with header `time,currency,impact` (UTC ISO 8601 times).
+
+    Use scheduled releases only: unscheduled events in a historical calendar would let the
+    backtest avoid news it could not have known about in advance.
+    """
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames != ["time", "currency", "impact"]:

@@ -7,7 +7,7 @@ pair has a signal: nothing could happen in it, so skipping it cannot change the 
 import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 from fxbot.backtest_broker import BacktestBroker, S10Lookup
 from fxbot.config import Settings
@@ -15,7 +15,6 @@ from fxbot.engine import Engine, weekend_phase
 from fxbot.history import History
 from fxbot.ledger import Ledger
 from fxbot.news import NewsEvent
-from fxbot.risk import uk_trading_day
 from fxbot.strategy import Signal, evaluate
 
 M15 = timedelta(minutes=15)
@@ -46,7 +45,7 @@ class BacktestResult:
     start_nav: float
     end_nav: float
     trades: list[TradeRecord]
-    daily_nav: dict[date, float]
+    nav_marks: list[float]   # NAV after every replayed M15 close (for drawdown)
     rejections: Counter = field(default_factory=Counter)
     blocked: Counter = field(default_factory=Counter)
     alerts: list[tuple[str, str]] = field(default_factory=list)
@@ -72,14 +71,18 @@ def cached(signal_fn):
 
 def run(history: History, settings: Settings, start: datetime, end: datetime, *,
         nav: float = 1000.0, news: list[NewsEvent] | None = None, signal_fn=evaluate,
-        s10: S10Lookup | None = None) -> BacktestResult:
-    """Replay M15 candles opening in [start, end). `news=None` means no calendar (filter off)."""
+        s10: S10Lookup | None = None, skip_idle: bool = True) -> BacktestResult:
+    """Replay M15 candles opening in [start, end). `news=None` means no calendar (filter off).
+
+    Trades still open after the last candle are closed at the next available price, so every
+    trade is counted. `skip_idle=False` runs every cycle (slow; for verification only).
+    """
     events = list(news or [])
     broker = BacktestBroker(history, settings, nav, s10)
     sig = cached(signal_fn)
     series = history.get(settings.pairs[0], "M15")
     times = [t for t in series.times if start <= t < end]
-    daily: dict[date, float] = {}
+    marks: list[float] = []
     alerts: list[tuple[str, str]] = []
     with tempfile.TemporaryDirectory() as tmp:
         ledger = Ledger(f"{tmp}/ledger.db", durable=False)
@@ -90,12 +93,17 @@ def run(history: History, settings: Settings, start: datetime, end: datetime, *,
             broker.advance(now)
             if broker.trades and weekend_phase(now, settings) != "normal":
                 engine.flatten(now)
-            if broker.trades or any(
-                    sig(p, broker.candles(p, "H1", settings.h1_window),
-                        broker.candles(p, "M15", settings.m15_window), settings)
-                    for p in settings.pairs):
+            signals = [sig(p, broker.candles(p, "H1", settings.h1_window),
+                           broker.candles(p, "M15", settings.m15_window), settings)
+                       for p in settings.pairs]   # every pair, so the no-skill base is complete
+            if broker.trades or any(signals) or not skip_idle:
                 engine.run_cycle(now)
-            daily[uk_trading_day(now)] = broker.account().nav
+            marks.append(broker.account().nav)
+        if times:   # close what is still open so every trade is counted
+            final = times[-1] + 2 * M15 + DELAY
+            broker.advance(final)
+            for trade_id in list(broker.trades):
+                broker.close_trade(trade_id)
         risk = {p.trade_id: (p.risk_gbp or 0.0) for p in ledger.all_positions() if p.trade_id}
         decisions = ledger.decisions()
         halted = ledger.halt_reason()
@@ -104,7 +112,7 @@ def run(history: History, settings: Settings, start: datetime, end: datetime, *,
                           c.entry, c.exit, c.pl, risk.get(c.trade_id, 0.0), c.reason)
               for c in broker.closed]
     end_nav = broker.account().nav if times else nav
-    return BacktestResult(nav, end_nav, trades, daily,
+    return BacktestResult(nav, end_nav, trades, marks,
                           Counter(r for _, o, r in decisions if o == "rejected"),
                           Counter(r for _, o, r in decisions if o == "blocked"),
                           alerts, halted, len(broker.trades), dict(sig.memo))

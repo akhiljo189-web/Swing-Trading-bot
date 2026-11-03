@@ -10,7 +10,7 @@ from fxbot.indicators import atr, ema
 LONDON = ZoneInfo("Europe/London")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Candle:
     time: datetime  # UTC open time
     open: float

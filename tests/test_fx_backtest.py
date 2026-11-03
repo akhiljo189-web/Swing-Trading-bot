@@ -63,6 +63,30 @@ class BacktestRunTests(unittest.TestCase):
             self.assertFalse(local.weekday() == 4 and local.hour >= 20, t)
             self.assertLess((t.close_time - t.open_time).days, 2)
 
+    def test_skipping_idle_cycles_changes_nothing(self):
+        end = BEGIN + timedelta(days=10)
+        fast = run(HISTORY, S, BEGIN, end)
+        slow = run(HISTORY, S, BEGIN, end, skip_idle=False)
+        self.assertEqual(fast.trades, slow.trades)
+        self.assertEqual(fast.nav_marks, slow.nav_marks)
+        self.assertEqual(fast.rejections, slow.rejections)
+
+    def test_trades_open_at_the_end_are_closed_and_counted(self):
+        t = self.result.trades[5]
+        r = run(HISTORY, S, BEGIN, t.open_time + timedelta(minutes=20))
+        self.assertEqual(r.open_at_end, 0)
+        self.assertAlmostEqual(r.end_nav - r.start_nav, sum(x.pl_gbp for x in r.trades), places=6)
+        self.assertIn(t.pair, [x.pair for x in r.trades if x.reason == "market"])
+
+    def test_signals_recorded_for_every_pair(self):
+        times = {key[1] for key in self.result.signals}
+        for when in list(times)[:200]:
+            self.assertEqual({p for p, t in self.result.signals if t == when}, set(S.pairs))
+
+    def test_nav_marks_every_cycle(self):
+        self.assertEqual(len(self.result.nav_marks),
+                         len([t for t in HISTORY.get("EUR_USD", "M15").times if BEGIN <= t < END]))
+
     def test_no_lookahead(self):
         """Removing all data after a cut-off must not change any trade closed before it."""
         cut = START + timedelta(days=55)

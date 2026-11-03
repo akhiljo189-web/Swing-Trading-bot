@@ -7,12 +7,11 @@ from fxbot.backtest import BacktestResult, TradeRecord
 from fxbot.risk import uk_trading_day
 
 
-def max_drawdown(daily_nav: dict[date, float]) -> float:
-    """Largest peak-to-trough fall of daily NAV, as a fraction of the peak."""
-    peak, worst = None, 0.0
-    for day in sorted(daily_nav):
-        nav = daily_nav[day]
-        peak = nav if peak is None else max(peak, nav)
+def max_drawdown(marks: list[float], start_nav: float) -> float:
+    """Largest peak-to-trough fall of NAV across every mark, starting from `start_nav`."""
+    peak, worst = start_nav, 0.0
+    for nav in marks:
+        peak = max(peak, nav)
         worst = max(worst, (peak - nav) / peak)
     return worst
 
@@ -86,7 +85,7 @@ def summarize(result: BacktestResult, bootstrap_runs: int = 2000, seed: int = 0)
         "expectancy_r": sum(t.r for t in trades) / n if n else 0.0,
         "win_rate": len(wins) / n if n else 0.0,
         "profit_factor": gross_win / gross_loss if gross_loss else None,   # None = no losses
-        "max_drawdown": max_drawdown(result.daily_nav),
+        "max_drawdown": max_drawdown(result.nav_marks, result.start_nav),
         "worst_losing_streak": losing_streak(trades),
         "expectancy_r_ci95": bootstrap_ci(trades, bootstrap_runs, seed),
         "per_pair": {p: _group(ts) for p, ts in sorted(by_pair.items())},
@@ -94,11 +93,14 @@ def summarize(result: BacktestResult, bootstrap_runs: int = 2000, seed: int = 0)
         "exits": dict(Counter(t.reason for t in trades)),
         "rejections": dict(result.rejections),
         "notional_cap_hits": result.rejections.get("max gross notional", 0),
-        "blocked_cycles": dict(result.blocked),
+        "blocked_cycles": dict(result.blocked),   # only cycles that had a signal or an open trade
         "max_simultaneous_positions": max_simultaneous(trades),
         "days_with_multiple_trades": len(multi),
         "multi_trade_days_all_lost": (sum(all(t.pl_gbp < 0 for t in d) for d in multi) / len(multi)
                                       if multi else None),
+        # what that share would be if trades on the same day were independent
+        "multi_trade_days_all_lost_if_independent": (
+            sum((len(losses) / n) ** len(d) for d in multi) / len(multi) if multi else None),
         "open_at_end": result.open_at_end,
         "halted": result.halted,
     }

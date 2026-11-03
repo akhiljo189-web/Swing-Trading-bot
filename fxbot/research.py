@@ -1,4 +1,6 @@
 """Research report: walk-forward, variants, baselines and the Gate B check (spec §8, §10)."""
+import calendar
+import gc
 import itertools
 import json
 import multiprocessing
@@ -52,7 +54,8 @@ def random_direction(base: dict, seed: int):
 # --- walk-forward ---------------------------------------------------------------
 def add_months(t: datetime, months: int) -> datetime:
     y, m = divmod(t.month - 1 + months, 12)
-    return t.replace(year=t.year + y, month=m + 1)
+    year, month = t.year + y, m + 1
+    return t.replace(year=year, month=month, day=min(t.day, calendar.monthrange(year, month)[1]))
 
 
 def windows(start: datetime, end: datetime, train: int, test: int) -> list[tuple]:
@@ -70,19 +73,21 @@ def grid_settings(settings: Settings, grid: dict) -> list[Settings]:
     return [replace(settings, **dict(zip(keys, values))) for values in itertools.product(*grid.values())]
 
 
-def chain(history, plan: list[tuple], news, nav: float = 1000.0) -> BacktestResult:
+def chain(history, plan: list[tuple], news, nav: float = 1000.0, signal_fn=None) -> BacktestResult:
     """Run consecutive (settings, start, end) windows, carrying NAV forward; merge results."""
-    merged = BacktestResult(nav, nav, [], {})
+    merged = BacktestResult(nav, nav, [], [])
     for settings, start, end in plan:
-        r = run(history, settings, start, end, nav=merged.end_nav, news=news)
+        extra = {"signal_fn": signal_fn} if signal_fn is not None else {}
+        r = run(history, settings, start, end, nav=merged.end_nav, news=news, **extra)
         merged.end_nav = r.end_nav
         merged.trades += r.trades
-        merged.daily_nav.update(r.daily_nav)
+        merged.nav_marks += r.nav_marks
+        merged.signals.update(r.signals)
         merged.rejections += r.rejections
         merged.blocked += r.blocked
         merged.alerts += r.alerts
         merged.halted = merged.halted or r.halted
-        merged.open_at_end = r.open_at_end
+        merged.open_at_end += r.open_at_end
     return merged
 
 
@@ -105,24 +110,26 @@ def walk_forward(history, settings, start, end, news, train_months=24, test_mont
 _WORKER: dict = {}
 
 
-def _init_worker(history, settings, start, end, news, base):
-    _WORKER.update(history=history, settings=settings, start=start, end=end, news=news, base=base)
+def _init_worker(history, plan, news, base):
+    _WORKER.update(history=history, plan=plan, news=news, base=base)
 
 
 def _no_skill_run(seed: int) -> float:
     w = _WORKER
-    r = run(w["history"], w["settings"], w["start"], w["end"], news=w["news"],
-            signal_fn=random_direction(w["base"], seed))
+    r = chain(w["history"], w["plan"], w["news"], signal_fn=random_direction(w["base"], seed))
     return summarize(r, bootstrap_runs=0)["expectancy_r"]
 
 
-def no_skill(history, settings, start, end, news, base, runs: int, processes: int | None) -> list[float]:
+def no_skill(history, plan, news, base, runs: int, processes: int | None) -> list[float]:
+    """Expectancy (R) of `runs` seeded random-direction runs over the walk-forward windows."""
     if processes == 1:
-        _init_worker(history, settings, start, end, news, base)
+        _init_worker(history, plan, news, base)
         return [_no_skill_run(seed) for seed in range(runs)]
-    with ProcessPoolExecutor(processes, mp_context=multiprocessing.get_context("fork"),
-                             initializer=_init_worker,
-                             initargs=(history, settings, start, end, news, base)) as pool:
+    methods = multiprocessing.get_all_start_methods()
+    context = multiprocessing.get_context("fork" if "fork" in methods else None)
+    gc.freeze()   # keep forked workers from copying the shared history pages
+    with ProcessPoolExecutor(processes, mp_context=context, initializer=_init_worker,
+                             initargs=(history, plan, news, base)) as pool:
         return list(pool.map(_no_skill_run, range(runs), chunksize=8))
 
 
@@ -151,31 +158,31 @@ def gate_b(report: dict) -> dict:
 def research(history: History, settings: Settings, start: datetime, end: datetime,
              news: list[NewsEvent] | None, *, train_months=24, test_months=6, grid=GRID,
              no_skill_runs=1000, processes: int | None = None) -> dict:
+    """Every comparison in Gate B uses the same walk-forward windows and chosen settings."""
     plan = walk_forward(history, settings, start, end, news, train_months, test_months, grid)
     if not plan:
         raise ValueError("period too short for one training plus one test window")
     oos_start = plan[0][1]
+
+    def variant(**changes) -> BacktestResult:
+        return chain(history, [(replace(s, **changes), a, b) for s, a, b in plan], news)
+
     wf = chain(history, plan, news)
-    wf06 = chain(history, [(replace(s, slippage_pips_per_side=0.6), a, b) for s, a, b in plan], news)
-    fixed = run(history, settings, oos_start, end, news=news)
+    sensitivity = {str(sl): summarize(variant(slippage_pips_per_side=sl), bootstrap_runs=0)
+                   for sl in SLIPPAGE}
     report = {
         "period": {"start": start.isoformat(), "oos_start": oos_start.isoformat(), "end": end.isoformat()},
         "walk_forward_params": [{"start": a.isoformat(), "end": b.isoformat(),
                                  **{k: getattr(s, k) for k in grid}} for s, a, b in plan],
         "walk_forward": summarize(wf),
-        "walk_forward_slippage_0.6": summarize(wf06, bootstrap_runs=0),
-        "fixed_params": summarize(fixed),
-        "slippage_sensitivity": {str(sl): summarize(run(history, replace(settings, slippage_pips_per_side=sl),
-                                                        oos_start, end, news=news), bootstrap_runs=0)
-                                 for sl in SLIPPAGE},
-        "time_exit_off": summarize(run(history, replace(settings, time_exit_minutes=None),
-                                       oos_start, end, news=news), bootstrap_runs=0),
-        "news_filter_off": summarize(run(history, settings, oos_start, end, news=None), bootstrap_runs=0),
-        "trend_baseline": summarize(run(history, settings, oos_start, end, news=news,
-                                        signal_fn=trend_baseline), bootstrap_runs=0),
+        "walk_forward_slippage_0.6": sensitivity["0.6"],
+        "slippage_sensitivity": sensitivity,
+        "time_exit_off": summarize(variant(time_exit_minutes=None), bootstrap_runs=0),
+        "news_filter_off": summarize(chain(history, plan, None), bootstrap_runs=0),
+        "trend_baseline": summarize(chain(history, plan, news, signal_fn=trend_baseline), bootstrap_runs=0),
         "no_skill": {"runs": no_skill_runs,
-                     "expectancy_r": no_skill(history, settings, oos_start, end, news, fixed.signals,
-                                              no_skill_runs, processes)},
+                     "expectancy_r": no_skill(history, plan, news, wf.signals, no_skill_runs, processes)},
+        "fixed_params": summarize(run(history, settings, oos_start, end, news=news), bootstrap_runs=0),
     }
     report["gate_b"] = gate_b(report)
     return report
@@ -207,8 +214,23 @@ def write_report(report: dict, out_dir: Path) -> tuple[Path, Path]:
         f"- Expectancy: {wf['expectancy_r']:.3f} R (95% CI by trading day: {wf['expectancy_r_ci95']})",
         f"- Net: £{wf['net_gbp']:.2f}; profit factor: {wf['profit_factor']}",
         f"- Max drawdown: {wf['max_drawdown']:.1%}; worst losing streak: {wf['worst_losing_streak']}",
-        "", "## Slippage sensitivity (fixed parameters)", "", "| Pips per side | Trades | Expectancy R |", "|---|---|---|",
+        "", "## Slippage sensitivity (walk-forward settings)", "", "| Pips per side | Trades | Expectancy R |",
+        "|---|---|---|",
         *[f"| {k} | {v['trades']} | {v['expectancy_r']:.3f} |" for k, v in report["slippage_sensitivity"].items()],
+        "", "## Baselines (same windows, settings and costs)", "",
+        f"- Trend baseline: {report['trend_baseline']['trades']} trades, "
+        f"{report['trend_baseline']['expectancy_r']:.3f} R",
+        f"- No-skill ({report['no_skill']['runs']} runs): 95th percentile {g['no_skill_p95_expectancy_r']} R",
+        "", "## Variants", "", "| Variant | Trades | Expectancy R | Max drawdown |", "|---|---|---|---|",
+        *[f"| {name} | {report[key]['trades']} | {report[key]['expectancy_r']:.3f} | {report[key]['max_drawdown']:.1%} |"
+          for name, key in (("Time exit off", "time_exit_off"), ("News filter off", "news_filter_off"),
+                            ("Fixed default parameters", "fixed_params"))],
+        "", "## Per pair (walk-forward)", "", "| Pair | Trades | Net £ | Expectancy R |", "|---|---|---|---|",
+        *[f"| {p} | {v['trades']} | {v['net_gbp']:.2f} | {v['expectancy_r']:.3f} |" for p, v in wf["per_pair"].items()],
+        "", "## Per year (walk-forward)", "", "| Year | Trades | Net £ | Expectancy R |", "|---|---|---|---|",
+        *[f"| {y} | {v['trades']} | {v['net_gbp']:.2f} | {v['expectancy_r']:.3f} |" for y, v in wf["per_year"].items()],
+        "", "Caveats: GBP conversion uses mid rates (no conversion spread); overnight financing is not "
+        "modelled (matters only for the time-exit-off variant).",
         "", "## Gate B", "", "| Check | Result |", "|---|---|",
         *[f"| {k} | {'PASS' if v else 'FAIL'} |" for k, v in g["checks"].items()],
         "", f"**Gate B automated checks: {'PASSED' if g['passed'] else 'NOT PASSED'}.** {g['manual_review']}", "",
