@@ -24,6 +24,11 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 Settings(**bad)
 
+    def test_execution_safety_defaults(self):
+        s = Settings()
+        self.assertEqual((s.price_bound_pips, s.price_max_age_seconds), (1.0, 60))
+        self.assertEqual((s.friday_flatten_start, s.friday_flatten_deadline), (time(19, 30), time(20)))
+
     def test_settings_are_immutable(self):
         with self.assertRaises(Exception):
             Settings().risk_per_trade = 0.025

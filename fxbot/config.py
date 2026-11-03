@@ -40,6 +40,9 @@ class Settings:
     daily_loss_limit: float = 0.015
     max_margin_fraction: float = 0.5
     max_gross_notional_multiple: float = 10.0
+    # execution safety
+    price_bound_pips: float = 1.0        # max entry slippage accepted by the broker
+    price_max_age_seconds: int = 60      # older prices count as stale
 
     def __post_init__(self):
         if self.ema_slow > self.h1_window or self.ema_fast > self.h1_window:
