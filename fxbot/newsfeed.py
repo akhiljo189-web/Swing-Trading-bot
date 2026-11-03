@@ -43,7 +43,10 @@ class LiveNewsFeed:
         if due and (self.attempted_at is None or now - self.attempted_at >= timedelta(minutes=5)):
             self.attempted_at = now
             try:
-                self.events, self.fetched_at = self.fetch(), now
+                events = self.fetch()
+                # a calendar whose events are all over a week old is last week's file: not fresh
+                if not events or max(e.time for e in events) >= now - timedelta(days=7):
+                    self.events, self.fetched_at = events, now
             except Exception:   # keep the last good copy; staleness is checked below
                 pass
         if self.fetched_at is None or now - self.fetched_at > self.max_age:

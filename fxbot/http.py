@@ -1,4 +1,5 @@
 """Minimal JSON-over-HTTPS transport (standard library only), injectable for tests."""
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -21,8 +22,8 @@ def urllib_transport(method: str, url: str, headers: dict, body: dict | None,
             raw, status = resp.read(), resp.status
     except urllib.error.HTTPError as exc:      # 4xx/5xx still carry a JSON body worth reading
         raw, status = exc.read(), exc.code
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise HttpError(str(exc)) from exc
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as exc:
+        raise HttpError(f"{type(exc).__name__}: {exc}") from exc
     try:
         return status, (json.loads(raw) if raw else {})
     except ValueError as exc:

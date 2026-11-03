@@ -17,5 +17,8 @@ class FakeTelegram(Telegram):
         return [u for u in self.inbox if u["update_id"] >= offset]
 
 
-def msg(update_id, text, chat=42):
-    return {"update_id": update_id, "message": {"chat": {"id": chat}, "text": text}}
+def msg(update_id, text, chat=42, date=None):
+    m = {"chat": {"id": chat}, "text": text}
+    if date is not None:
+        m["date"] = date
+    return {"update_id": update_id, "message": m}

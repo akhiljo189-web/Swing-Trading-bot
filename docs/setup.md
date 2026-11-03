@@ -20,7 +20,8 @@ Requires Python 3.12. In this folder:
 OANDA_PRACTICE_TOKEN=your-token OANDA_PRACTICE_ACCOUNT=your-account-id python -m unittest tests.test_fx_oanda_integration -v
 ```
 
-Run it while the market is open (Sunday 22:00 to Friday 22:00 UK time). It opens and closes one
+Run it while the market is open (Sunday evening to Friday evening: 22:00 UK, or 21:00 UK during
+the few weeks a year when US and UK clock changes differ). It opens and closes one
 1-unit EUR/USD trade. All tests must pass: they confirm that OANDA's real responses match what the
 bot expects. If anything fails, stop and report it; do not deploy.
 
@@ -51,6 +52,8 @@ bot expects. If anything fails, stop and report it; do not deploy.
 2. Send any message to your new bot, then open
    `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and copy `message.chat.id`.
 3. Commands once running: `/status`, `/pause`, `/resume` (reply YES), `/flatten` (reply YES).
+   `/flatten` closes every bot trade **and pauses** new trades; send `/resume` to trade again.
+   Commands sent while the bot was offline are ignored (older than 2 minutes).
 
 ## 5. Dead-man's switch
 
@@ -73,9 +76,12 @@ bot expects. If anything fails, stop and report it; do not deploy.
    | `TELEGRAM_BOT_TOKEN` | from BotFather |
    | `TELEGRAM_CHAT_ID` | your chat ID |
    | `HEALTHCHECK_URL` | healthchecks.io ping URL |
-   | `TRADING_ENABLED` | `true` (or `false` to start paused) |
+   | `TRADING_ENABLED` | `true` or `false` (`false` pauses at startup; setting it back to `true` does not undo a pause, send `/resume`) |
 
 5. Deploy. You should receive "fxbot started on the OANDA practice account" in Telegram.
+
+**Alerts you should expect:** fills, closes and a daily summary; a warning if no new trades have
+been possible for over an hour (with the reason); a warning if Telegram commands cannot be read.
 
 **First day:** a brand-new ledger on an account that already has history blocks new trades for
 the rest of that UK day ("no reliable daily snapshot today"). This is expected; trading starts the

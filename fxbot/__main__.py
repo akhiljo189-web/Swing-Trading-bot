@@ -6,6 +6,7 @@ stopped (the running bot holds the ledger lock). While it runs, use the Telegram
 import argparse
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -90,6 +91,19 @@ def cmd_fetch_data(args) -> int:
     return 0
 
 
+def open_live_ledger(path: str, wait_seconds: int = 60, sleep=time.sleep) -> Ledger | None:
+    """Wait for a previous instance (e.g. during a redeploy) to release the ledger lock."""
+    for _ in range(max(1, wait_seconds // 5)):
+        try:
+            return Ledger(path)
+        except LedgerLocked:
+            sleep(5)
+    try:
+        return Ledger(path)
+    except LedgerLocked:
+        return None
+
+
 def cmd_live(args) -> int:
     from fxbot.alerts import Alerter, Healthcheck, Telegram
     from fxbot.control import Control
@@ -104,9 +118,12 @@ def cmd_live(args) -> int:
         return 2
     Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
     try:
-        ledger = Ledger(str(Path(cfg.data_dir) / "ledger.db"))
+        ledger = open_live_ledger(str(Path(cfg.data_dir) / "ledger.db"))
     except LedgerError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if ledger is None:
+        print("error: another fxbot instance still holds the ledger", file=sys.stderr)
         return 2
     clock = lambda: datetime.now(timezone.utc)   # noqa: E731
     telegram = Telegram(cfg.telegram_token, cfg.telegram_chat_id) if cfg.telegram_token else None
@@ -116,7 +133,13 @@ def cmd_live(args) -> int:
     broker = OandaBroker(cfg.token, cfg.account_id, cfg.environment)
     settings = Settings()
     engine = Engine(broker, ledger, settings, LiveNewsFeed(), alerter)
-    control = Control(telegram, ledger, lambda: status_text(ledger)) if telegram else None
+    def status() -> str:
+        try:
+            nav = broker.account().nav
+        except Exception:
+            nav = None
+        return status_text(ledger, nav)
+    control = Control(telegram, ledger, status) if telegram else None
     health = Healthcheck(cfg.healthcheck_url) if cfg.healthcheck_url else None
     alerter.info(f"fxbot started on the OANDA {cfg.environment} account.\n{status_text(ledger)}")
     LiveRunner(engine, ledger, settings, alerter, control, health, broker).run_forever()

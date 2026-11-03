@@ -2393,3 +2393,38 @@ git commit -m "Deploy fxbot on Railway, add setup guide and practice-account sui
 - **Verification before publishing:** all code was run in a scratch copy (suite OK, 2 skipped). 18 deliberate mutations (live double flag, exception halt, auth halt, late-candle retry, Friday flatten, weekend market hours, chat filter, confirmation expiry, update offset persistence, stale-news block, alert de-duplication, SL/TP excluded from pending orders, transaction ID hold-back, incomplete candles dropped, loss conversion factor, 5xx not treated as rejection, auth flag, read-only S10 cache in workers) each make the suite fail. A real bug was caught on the way: the first `parse_time` swallowed the UTC offset and produced naive datetimes.
 - **Placeholders:** none. **Type consistency:** interfaces above match the code blocks.
 - **Cannot be verified here:** real OANDA, Telegram and Forex Factory responses; the Docker build; Railway's `railway.json` keys. The setup guide asks for these to be confirmed (integration suite, first deployment message, service settings).
+
+## Amendments after the Plan 4 code review (implemented; code in the repo supersedes the blocks above)
+
+No critical issues were found. Each important finding was reproduced with a failing test before
+fixing; 22 new mutations each fail the suite.
+
+- **Network glitches could crash the loop:** the transport now also wraps `http.client` protocol
+  errors; `Telegram.send` and the healthcheck never raise; every non-trading part of
+  `LiveRunner.step` (Telegram, healthcheck, notifications, daily summary) runs in `_safe` (log only),
+  while cycles and flattening keep `_guard` (halt + critical alert).
+- **Reads retried (spec §7):** GETs are attempted 3 times with 0.5 s / 1 s backoff on network errors
+  and 5xx; POST/PUT are never retried.
+- **No catch-up trading:** a cycle more than 90 s after its candle close runs with
+  `engine.run_cycle(now, allow_entries=False)` — it reconciles and protects but blocks entries with
+  `"late cycle: no catch-up entries"`.
+- **Flatten could report success falsely:** `close_trade` is True only when OANDA returns an
+  `orderFillTransaction`; a flatten request is cleared only after the broker's own trade list shows
+  no bot trades. A confirmed `/flatten` also **pauses** new entries until `/resume`.
+- **Silent stops:** the runner alerts when the same block reason persists for over an hour (user
+  pauses and late cycles excluded) and when Telegram cannot be read for ~5 minutes.
+- **OANDA formats:** cancels use `clientOrderID` (falling back to the in-memory map); close and fill
+  prices come from `tradesClosed[].price` / `tradeOpened.price`; `tradeReduced` becomes a `REDUCE`
+  transaction and the engine **halts** if it hits a bot trade; orders use `positionFill: OPEN_ONLY`;
+  a trade already closed when read back after a fill gives an `unknown` result (reconciled next
+  cycle, no false "no stop" halt); instrument info refreshes every 24 h.
+- **Smaller fixes:** `TRADING_ENABLED` accepts only `true`/`false`; Telegram messages older than
+  2 minutes (queued while offline) are ignored; `/status@BotName` works; `/status` shows open risk,
+  NAV and day P&L; a news file whose events are all over a week old counts as stale; `live` waits up
+  to 60 s for a previous instance to release the ledger; the setup guide covers the DST hour,
+  `/flatten` pausing and `TRADING_ENABLED` semantics; the practice-account suite adds a price-bound
+  cancel case.
+- **Not changed (accepted):** the healthcheck pings from the main loop on purpose — a hung loop must
+  stop the pings so the dead-man's switch fires; holiday early closes are not flattened (spec covers
+  Fridays only); no `flatten` CLI command (the bot holds the ledger while running; use `/flatten`).
+

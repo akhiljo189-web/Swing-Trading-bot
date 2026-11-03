@@ -14,7 +14,7 @@ class Telegram:
         try:
             status, _ = self._send("POST", f"{self.base}/sendMessage", {"Content-Type": "application/json"},
                                    {"chat_id": self.chat_id, "text": text[:4000]}, 10)
-        except HttpError:
+        except Exception:   # an alert channel failure must never stop the bot
             return False
         return status == 200
 
@@ -56,7 +56,7 @@ def http_status(url: str) -> int:
             return resp.status
     except urllib.error.HTTPError as exc:
         return exc.code
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except Exception:
         return 0
 
 

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from fx_fixtures import NOW, Harness, set_market
 from fxbot.alerts import Alerter
+from fxbot.broker import Price
 from fxbot.config import PAIRS, Settings
 from fxbot.live import ConfigError, LiveRunner, load_config, market_open, status_text
 
@@ -22,7 +23,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(load_config({**ENV, "OANDA_ENV": "live", "LIVE_TRADING_CONFIRMED": "yes"}).environment, "live")
 
     def test_invalid_configs(self):
-        for env in ({}, {**ENV, "OANDA_ENV": "demo"}, {**ENV, "TELEGRAM_BOT_TOKEN": "x"}):
+        for env in ({}, {**ENV, "OANDA_ENV": "demo"}, {**ENV, "TELEGRAM_BOT_TOKEN": "x"},
+                    {**ENV, "TRADING_ENABLED": "no"}):
             with self.assertRaises(ConfigError, msg=env):
                 load_config(env)
         self.assertFalse(load_config({**ENV, "TRADING_ENABLED": "false"}).trading_enabled)
@@ -54,7 +56,7 @@ class RunnerTests(unittest.TestCase):
         self.now = NOW
         self.cycles = []
         real = self.h.engine.run_cycle
-        self.h.engine.run_cycle = lambda now: self.cycles.append(now) or real(now)
+        self.h.engine.run_cycle = lambda now, **kw: self.cycles.append(now) or real(now, **kw)
         self.runner = LiveRunner(self.h.engine, self.h.ledger, S, self.alerter, broker=self.h.sim)
 
     def step(self, at):
@@ -76,7 +78,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.cycles[-1], later + timedelta(seconds=60))
 
     def test_unexpected_error_halts_but_loop_survives(self):
-        self.h.engine.run_cycle = lambda now: 1 / 0
+        self.h.engine.run_cycle = lambda now, **kw: 1 / 0
         self.step(NOW)
         self.assertTrue(self.h.ledger.halt_reason().startswith("halted: unexpected error"))
         self.assertIn("CRITICAL", self.log.messages[-1])
@@ -134,12 +136,66 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(pings), 4)                # 0, 5, 10, 15
         self.assertEqual(self.cycles, [])              # no trading while closed
 
+    def test_restart_late_in_the_candle_does_not_enter(self):
+        set_market(self.h.sim, "EUR_USD", breakout=+1)
+        late = NOW + timedelta(minutes=14)               # 09:29:10: the 09:15 signal is 14 min old
+        for pair, p in list(self.h.sim.price_data.items()):   # prices themselves are fresh
+            self.h.sim.price_data[pair] = Price(pair, late - timedelta(seconds=5), p.bid, p.ask, True,
+                                                p.loss_factor, p.value_factor)
+        self.step(late)
+        self.assertEqual(len(self.cycles), 1)
+        self.assertEqual(self.h.sim.orders_sent, [])
+
+    def test_flatten_complete_only_when_broker_confirms(self):
+        set_market(self.h.sim, "EUR_USD", breakout=+1)
+        self.step(NOW)
+        self.h.ledger.set("flatten_requested", NOW.isoformat())
+        real = self.h.engine.flatten
+        self.h.engine.flatten = lambda now: 0            # broker claims success, trade still open
+        self.step(NOW + timedelta(seconds=20))
+        self.assertIsNotNone(self.h.ledger.get("flatten_requested"))
+        self.h.engine.flatten = real
+        self.step(NOW + timedelta(seconds=90))
+        self.assertIsNone(self.h.ledger.get("flatten_requested"))
+
+    def test_entries_blocked_for_an_hour_raise_an_alert(self):
+        self.h.news_events = None                       # news feed down
+        for minutes in range(0, 76, 15):
+            for pair in PAIRS:
+                set_market(self.h.sim, pair, now=NOW + timedelta(minutes=minutes))
+            self.step(NOW + timedelta(minutes=minutes))
+        self.assertTrue(any("No new trades for over an hour" in m and "news feed unavailable" in m
+                            for m in self.log.messages))
+
+    def test_failing_parts_never_stop_the_loop(self):
+        class Boom:
+            def poll(self, now):
+                raise ValueError("telegram garbled")
+
+            def ping(self):
+                raise ValueError("ping garbled")
+        self.runner.control, self.runner.health = Boom(), Boom()
+        self.step(NOW)
+        self.assertEqual(self.cycles, [NOW])
+        self.assertIsNone(self.h.ledger.halt_reason())
+
+    def test_telegram_failures_are_reported(self):
+        class Down:
+            def poll(self, now):
+                return False
+        self.runner.control = Down()
+        for s in range(0, 400, 10):
+            self.step(NOW + timedelta(seconds=s))
+        self.assertTrue(any("Telegram commands are not being received" in m for m in self.log.messages))
+
     def test_status_text(self):
         set_market(self.h.sim, "EUR_USD", breakout=+1)
         self.step(NOW)
         text = status_text(self.h.ledger)
         self.assertIn("Open bot trades: 1", text)
         self.assertIn("EUR_USD long", text)
+        self.assertIn("Open risk £", text)
+        self.assertIn("Day P&L £", status_text(self.h.ledger, nav=1005.0))
 
 
 if __name__ == "__main__":

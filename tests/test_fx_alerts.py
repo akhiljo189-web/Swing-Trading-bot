@@ -37,6 +37,10 @@ class NewsFeedTests(unittest.TestCase):
         self.assertIsNone(feed(NOW + timedelta(hours=3, minutes=1)))      # too old: block entries
         self.assertIsNone(LiveNewsFeed(lambda: (_ for _ in ()).throw(HttpError("x")))(NOW))
 
+    def test_last_weeks_calendar_counts_as_stale(self):
+        feed = LiveNewsFeed(lambda: [NewsEvent(NOW - timedelta(days=9), "USD", "High")])
+        self.assertIsNone(feed(NOW))
+
     def test_failed_refresh_is_not_retried_every_call(self):
         calls = []
         feed = LiveNewsFeed(lambda: calls.append(1) or (_ for _ in ()).throw(HttpError("x")))
@@ -67,6 +71,17 @@ class AlertTests(unittest.TestCase):
                                                {"chat_id": "42", "text": "hi"}))
         failing = Telegram("abc", "42", transport=lambda *a: (_ for _ in ()).throw(HttpError("down")))
         self.assertFalse(failing.send("hi"))
+
+    def test_telegram_send_never_raises(self):
+        tg = Telegram("abc", "42", transport=lambda *a: (_ for _ in ()).throw(ValueError("odd")))
+        self.assertFalse(tg.send("hi"))
+
+    def test_http_status_never_raises(self):
+        import http.client
+        from unittest import mock
+        from fxbot.alerts import http_status
+        with mock.patch("urllib.request.urlopen", side_effect=http.client.BadStatusLine("x")):
+            self.assertEqual(http_status("https://hc-ping.com/x"), 0)
 
     def test_healthcheck_ping(self):
         self.assertTrue(Healthcheck("https://hc-ping.com/x", get_status=lambda url: 200).ping())

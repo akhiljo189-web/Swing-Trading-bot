@@ -121,6 +121,11 @@ class Engine:
                     ledger.mark_failed(txn.client_id, "rejected by broker")
             elif txn.kind == "TRANSFER":
                 ledger.add_contribution(txn.txn_id, txn.time, txn.amount)
+            elif txn.kind == "REDUCE" and any(p.trade_id == txn.trade_id for p in ledger.open_positions()):
+                # the ledger has no partial positions: units, risk and P&L are now unknown
+                ledger.halt(f"halted: trade {txn.trade_id} partially closed by the broker")
+                self.alert("critical", f"trade {txn.trade_id} was partially closed by the broker "
+                           "(e.g. margin closeout); bot halted - check it in the OANDA app")
             ledger.set_last_txn_id(txn.txn_id)
 
         known = {p.trade_id for p in ledger.open_positions()}
@@ -148,7 +153,8 @@ class Engine:
                 self.alert("warning", f"trade {p.trade_id} closed without a transaction; P&L unknown")
 
     # --- the cycle ---------------------------------------------------------
-    def run_cycle(self, now: datetime) -> CycleReport:
+    def run_cycle(self, now: datetime, allow_entries: bool = True) -> CycleReport:
+        """One cycle. allow_entries=False (a late cycle) reconciles and protects but never enters."""
         rep, s, ledger = CycleReport(now), self.s, self.ledger
         blocks: list[str] = []
 
@@ -252,6 +258,8 @@ class Engine:
         events = self.news(now)
         if events is None:
             block("news feed unavailable")
+        if not allow_entries:
+            block("late cycle: no catch-up entries")
 
         if blocks:
             rep.blocked = blocks[0]

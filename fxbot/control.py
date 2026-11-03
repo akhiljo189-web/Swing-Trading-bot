@@ -5,10 +5,9 @@ within two minutes. Commands, pending confirmations and the update offset live i
 so a restart neither loses nor replays them.
 """
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fxbot.alerts import Telegram
-from fxbot.http import HttpError
 from fxbot.ledger import Ledger
 
 CONFIRM_WINDOW = timedelta(minutes=2)
@@ -22,12 +21,13 @@ class Control:
     def _reply(self, text: str) -> None:
         self.telegram.send(text)
 
-    def poll(self, now: datetime) -> None:
+    def poll(self, now: datetime) -> bool:
+        """Process new messages; False if Telegram could not be read."""
         offset = int(self.ledger.get("telegram_offset", "0"))
         try:
             updates = self.telegram.updates(offset)
-        except HttpError:
-            return
+        except Exception:
+            return False
         for update in updates:
             self.ledger.set("telegram_offset", str(update["update_id"] + 1))
             message = update.get("message") or {}
@@ -36,11 +36,16 @@ class Control:
             if chat != self.telegram.chat_id:
                 self.ledger.record(now, None, "command", f"ignored message from chat {chat}")
                 continue
+            sent = message.get("date")
+            if sent is not None and now - datetime.fromtimestamp(sent, timezone.utc) > CONFIRM_WINDOW:
+                self.ledger.record(now, None, "command", f"ignored old message: {text[:60]}")
+                continue   # never act on commands queued while the bot was down
             self.ledger.record(now, None, "command", text[:100])
             self.handle(text, now)
+        return True
 
     def handle(self, text: str, now: datetime) -> None:
-        command = text.split()[0].lower() if text else ""
+        command = text.split()[0].split("@")[0].lower() if text else ""
         if command == "/status":
             self._reply(self.status())
         elif command == "/pause":
@@ -63,6 +68,8 @@ class Control:
                 self._reply("Resumed." + note)
             else:
                 self.ledger.set("flatten_requested", now.isoformat())
-                self._reply("Closing all bot trades now. You will get a message when done.")
+                self.ledger.pause("paused: /flatten requested")
+                self._reply("Closing all bot trades now and pausing new trades. "
+                            "You will get a message when done; send /resume to trade again.")
         else:
             self._reply(HELP)

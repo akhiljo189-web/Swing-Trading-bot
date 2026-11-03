@@ -19,10 +19,11 @@ class ControlTests(unittest.TestCase):
         self.tg = FakeTelegram()
         self.control = Control(self.tg, self.ledger, lambda: "STATUS")
 
-    def say(self, *texts, chat=42, at=NOW):
+    def say(self, *texts, chat=42, at=NOW, sent=None):
         base = int(self.ledger.get("telegram_offset", "0"))
-        self.tg.inbox += [msg(base + i, t, chat) for i, t in enumerate(texts)]
-        self.control.poll(at)
+        when = int((sent or at).timestamp())
+        self.tg.inbox += [msg(base + i, t, chat, when) for i, t in enumerate(texts)]
+        return self.control.poll(at)
 
     def test_status_and_pause(self):
         self.say("/status", "/pause")
@@ -54,6 +55,25 @@ class ControlTests(unittest.TestCase):
         self.ledger.resume()
         Control(self.tg, self.ledger, lambda: "S").poll(NOW)           # same inbox, new instance
         self.assertIsNone(self.ledger.pause_reason())
+
+    def test_old_messages_are_never_replayed(self):
+        self.say("/pause", sent=NOW - timedelta(hours=5))
+        self.assertIsNone(self.ledger.pause_reason())
+
+    def test_command_with_bot_name(self):
+        self.say("/status@fxbot_helper_bot")
+        self.assertEqual(self.tg.sent[0], "STATUS")
+
+    def test_confirmed_flatten_also_pauses_entries(self):
+        self.say("/flatten", "yes")
+        self.assertIsNotNone(self.ledger.pause_reason())
+        self.assertIn("/resume", self.tg.sent[-1])
+
+    def test_poll_reports_failures(self):
+        def broken(offset):
+            raise ValueError("garbled")
+        self.tg.updates = broken
+        self.assertFalse(self.control.poll(NOW))
 
     def test_unknown_text_gets_help(self):
         self.say("hello")

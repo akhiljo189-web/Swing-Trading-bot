@@ -4,7 +4,8 @@ Everything OANDA-specific is normalised here; the engine never sees OANDA JSON.
 The response formats below follow OANDA's v20 documentation as understood when this was written;
 `tests/test_fx_oanda_integration.py` verifies them against a real practice account.
 """
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 
 from fxbot.broker import (Account, BrokerError, InstrumentInfo, OrderResult, PendingOrder, Price,
                           Trade, Txn)
@@ -15,6 +16,8 @@ from fxbot.strategy import Candle
 
 HOSTS = {"practice": "https://api-fxpractice.oanda.com", "live": "https://api-fxtrade.oanda.com"}
 MAX_CANDLES = 5000
+READ_ATTEMPTS = 3                 # spec §7: reads retried with backoff; orders never are
+INFO_MAX_AGE = timedelta(hours=24)
 
 
 def parse_time(value: str) -> datetime:
@@ -39,23 +42,33 @@ def hist_candle(c: dict) -> HistCandle:
 
 class OandaBroker:
     def __init__(self, token: str, account_id: str, environment: str = "practice",
-                 transport: Transport = urllib_transport, timeout: float = 10.0):
+                 transport: Transport = urllib_transport, timeout: float = 10.0, sleep=time.sleep,
+                 clock=lambda: datetime.now(timezone.utc)):
         if environment not in HOSTS:
             raise ValueError(f"environment must be one of {sorted(HOSTS)}")
         self.base, self.account_id, self.timeout, self._send = HOSTS[environment], account_id, timeout, transport
         self._headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                          "Accept-Datetime-Format": "RFC3339"}
-        self._info: dict[str, dict] = {}
+        self._sleep, self._clock = sleep, clock
+        self._info: dict[str, tuple[datetime, dict]] = {}
         self._order_client: dict[str, str] = {}   # order ID -> client ID (to map cancels)
         self.auth_failed = False
 
     # --- plumbing --------------------------------------------------------------
     def _request(self, method: str, path: str, body: dict | None = None,
                  ok: tuple[int, ...] = (200,)) -> tuple[int, dict]:
-        try:
-            status, data = self._send(method, self.base + path, self._headers, body, self.timeout)
-        except HttpError as exc:
-            raise BrokerError(f"OANDA unreachable: {exc}") from exc
+        attempts = READ_ATTEMPTS if method == "GET" else 1   # an order is never sent twice
+        for attempt in range(attempts):
+            if attempt:
+                self._sleep(0.5 * 2 ** (attempt - 1))
+            try:
+                status, data = self._send(method, self.base + path, self._headers, body, self.timeout)
+            except HttpError as exc:
+                if attempt == attempts - 1:
+                    raise BrokerError(f"OANDA unreachable: {exc}") from exc
+                continue
+            if status < 500 or attempt == attempts - 1:
+                break
         if status in (401, 403):
             self.auth_failed = True
             raise BrokerError(f"OANDA rejected the credentials ({status})")
@@ -70,12 +83,13 @@ class OandaBroker:
         return f"/v3/accounts/{self.account_id}{suffix}"
 
     def _instrument(self, pair: str) -> dict:
-        if pair not in self._info:
+        cached = self._info.get(pair)
+        if cached is None or self._clock() - cached[0] > INFO_MAX_AGE:   # margin rates can change
             found = self._get(self._acct(f"/instruments?instruments={pair}"))["instruments"]
             if not found:
                 raise BrokerError(f"unknown instrument {pair}")
-            self._info[pair] = found[0]
-        return self._info[pair]
+            cached = self._info[pair] = (self._clock(), found[0])
+        return cached[1]
 
     def _fmt(self, pair: str, value: float) -> str:
         return f"{value:.{int(self._instrument(pair)['displayPrecision'])}f}"
@@ -149,18 +163,25 @@ class OandaBroker:
         elif kind == "ORDER_FILL":
             for closed in t.get("tradesClosed", []):
                 found.append(Txn(tid, "CLOSE", at, trade_id=closed["tradeID"], pair=t["instrument"],
-                                 units=int(float(closed["units"])), price=float(t["price"]),
+                                 units=int(float(closed["units"])), price=float(closed.get("price", t.get("price", 0))),
                                  amount=float(closed["realizedPL"])))
+            reduced = t.get("tradeReduced")
+            if reduced:   # a partial close (e.g. margin closeout): the engine halts on it
+                found.append(Txn(tid, "REDUCE", at, trade_id=reduced["tradeID"], pair=t["instrument"],
+                                 units=int(float(reduced["units"])), price=float(reduced.get("price", t.get("price", 0))),
+                                 amount=float(reduced.get("realizedPL", 0))))
             opened = t.get("tradeOpened")
             if opened:
                 cid = (opened.get("clientExtensions") or {}).get("id") or self._order_client.get(t.get("orderID"))
                 found.append(Txn(tid, "FILL", at, client_id=cid, trade_id=opened["tradeID"], pair=t["instrument"],
-                                 units=int(float(opened["units"])), price=float(opened.get("price", t["price"]))))
+                                 units=int(float(opened["units"])), price=float(opened.get("price", t.get("price", 0)))))
         elif kind == "MARKET_ORDER_REJECT":
             found.append(Txn(tid, "REJECT", at, client_id=(t.get("clientExtensions") or {}).get("id"),
                              pair=t.get("instrument")))
-        elif kind == "ORDER_CANCEL" and t.get("orderID") in self._order_client:
-            found.append(Txn(tid, "REJECT", at, client_id=self._order_client[t["orderID"]]))
+        elif kind == "ORDER_CANCEL":
+            cid = t.get("clientOrderID") or self._order_client.get(t.get("orderID"))
+            if cid:
+                found.append(Txn(tid, "REJECT", at, client_id=cid))
         elif kind == "TRANSFER_FUNDS":
             found.append(Txn(tid, "TRANSFER", at, amount=float(t["amount"])))
         return [Txn(tid - 1 if i < len(found) - 1 else tid, x.kind, x.time, x.client_id, x.trade_id,
@@ -171,13 +192,15 @@ class OandaBroker:
                      price_bound: float) -> OrderResult:
         ext = {"id": client_id, "tag": "fxbot"}
         body = {"order": {"type": "MARKET", "instrument": pair, "units": str(units), "timeInForce": "FOK",
-                          "positionFill": "DEFAULT", "priceBound": self._fmt(pair, price_bound),
+                          "positionFill": "OPEN_ONLY", "priceBound": self._fmt(pair, price_bound),
                           "stopLossOnFill": {"distance": self._fmt(pair, stop_distance), "timeInForce": "GTC"},
                           "clientExtensions": ext, "tradeClientExtensions": ext}}
         status, data = self._request("POST", self._acct("/orders"), body, ok=(201, 400, 404))
         if "orderFillTransaction" in data and data["orderFillTransaction"].get("tradeOpened"):
             opened = data["orderFillTransaction"]["tradeOpened"]
             trade = self._get(self._acct(f"/trades/{opened['tradeID']}"))["trade"]
+            if trade.get("state", "OPEN") != "OPEN":   # already stopped out: let reconciliation record it
+                return OrderResult("unknown", reason="trade closed immediately after fill")
             sl = trade.get("stopLossOrder")
             return OrderResult("filled", opened["tradeID"], float(trade["price"]), int(float(trade["initialUnits"])),
                                float(sl["price"]) if sl else None)
@@ -194,9 +217,10 @@ class OandaBroker:
         return status == 200
 
     def close_trade(self, trade_id: str) -> bool:
-        status, _ = self._request("PUT", self._acct(f"/trades/{trade_id}/close"), {"units": "ALL"},
-                                  ok=(200, 400, 404))
-        return status == 200
+        """True only if a closing fill happened (OANDA can answer 200 with a cancellation)."""
+        status, data = self._request("PUT", self._acct(f"/trades/{trade_id}/close"), {"units": "ALL"},
+                                     ok=(200, 400, 404))
+        return status == 200 and "orderFillTransaction" in data
 
     # --- history (backtests) ---------------------------------------------------------
     def fetch_history(self, pair: str, granularity: str, start: datetime, end: datetime) -> list[HistCandle]:

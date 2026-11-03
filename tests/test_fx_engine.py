@@ -501,6 +501,22 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIsNone(h.ledger.get(f"missing:{tid}"))
         self.assertEqual(h.ledger.position(EUR_ID).status, "filled")
 
+    def test_partial_close_by_broker_halts(self):
+        h = Harness(self)
+        set_market(h.sim, "EUR_USD", breakout=+1)
+        h.cycle()
+        p = h.ledger.position(EUR_ID)
+        h.sim._txn("REDUCE", trade_id=p.trade_id, pair="EUR_USD")
+        self.assertTrue(h.cycle(LATER).blocked.startswith("halted: trade"))
+
+    def test_late_cycle_manages_trades_but_never_enters(self):
+        h = Harness(self)
+        set_market(h.sim, "EUR_USD", breakout=+1)
+        h.sim.now = NOW
+        rep = h.engine.run_cycle(NOW, allow_entries=False)
+        self.assertEqual(rep.blocked, "late cycle: no catch-up entries")
+        self.assertEqual(h.sim.orders_sent, [])
+
     def test_deposit_racing_the_snapshot_is_not_a_loss(self):
         h = Harness(self)
         h.cycle()                                             # ledger initialised on day 1

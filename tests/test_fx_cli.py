@@ -60,3 +60,20 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LedgerWaitTests(unittest.TestCase):
+    def test_live_waits_for_a_previous_instance_to_release_the_ledger(self):
+        from fxbot.__main__ import open_live_ledger
+        with tempfile.TemporaryDirectory() as tmp:
+            held = Ledger(f"{tmp}/ledger.db")
+            waits = []
+
+            def sleep(s):
+                waits.append(s)
+                if len(waits) == 3:
+                    held.close()
+            ledger = open_live_ledger(f"{tmp}/ledger.db", wait_seconds=60, sleep=sleep)
+            self.assertIsNotNone(ledger)
+            ledger.close()
+            self.assertEqual(len(waits), 3)

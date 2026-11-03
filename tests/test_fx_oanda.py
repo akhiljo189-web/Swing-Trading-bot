@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fxbot.broker import BrokerError
 from fxbot.http import HttpError
@@ -33,9 +33,27 @@ class FakeTransport:
         raise AssertionError(f"unexpected request {method} {path}")
 
 
-def broker(*routes):
+def broker(*routes, clock=None):
     t = FakeTransport(routes)
-    return OandaBroker("token", "001-004-1234567-001", "practice", transport=t), t
+    b = OandaBroker("token", "001-004-1234567-001", "practice", transport=t, sleep=lambda s: None,
+                    **({"clock": clock} if clock else {}))
+    return b, t
+
+
+class Flaky:
+    """Fails `failures` times with the given exception or status, then answers."""
+
+    def __init__(self, failures, answer, error=None, status=503):
+        self.left, self.answer, self.error, self.status, self.calls = failures, answer, error, status, 0
+
+    def __call__(self, method, url, headers, body, timeout):
+        self.calls += 1
+        if self.left:
+            self.left -= 1
+            if self.error:
+                raise self.error
+            return self.status, {"errorMessage": "busy"}
+        return 200, self.answer
 
 
 class ReadTests(unittest.TestCase):
@@ -105,6 +123,77 @@ class ReadTests(unittest.TestCase):
         self.assertEqual(b.instrument("EUR_USD").max_units, 100_000_000)
         b.instrument("EUR_USD")
         self.assertEqual(len(t.calls), 1)
+
+
+class ReviewTests(unittest.TestCase):
+    def test_reads_are_retried_three_times_with_backoff(self):
+        summary = {"account": {"NAV": "1", "marginUsed": "0", "lastTransactionID": "1"}}
+        sleeps = []
+        b = OandaBroker("t", "001", transport=Flaky(2, summary, HttpError("reset")), sleep=sleeps.append)
+        self.assertEqual(b.account().nav, 1.0)
+        self.assertEqual(len(sleeps), 2)
+        b = OandaBroker("t", "001", transport=Flaky(3, summary, status=503), sleep=lambda s: None)
+        with self.assertRaises(BrokerError):
+            b.account()
+
+    def test_orders_are_never_retried(self):
+        flaky = Flaky(1, {}, HttpError("reset"))
+        b = OandaBroker("t", "001", transport=flaky, sleep=lambda s: None)
+        b._info["EUR_USD"] = (datetime.now(UTC), EUR_INFO["instruments"][0])
+        with self.assertRaises(BrokerError):
+            b.market_order("EUR_USD", 1, "fxb-1", 0.001, 1.2)
+        self.assertEqual(flaky.calls, 1)
+
+    def test_transport_wraps_protocol_errors(self):
+        import http.client
+        from unittest import mock
+        from fxbot.http import urllib_transport
+        with mock.patch("urllib.request.urlopen", side_effect=http.client.IncompleteRead(b"")):
+            with self.assertRaises(HttpError):
+                urllib_transport("GET", "https://example.com", {}, None, 1)
+
+    def test_close_counts_only_when_something_filled(self):
+        b, _ = broker(("PUT", ACCT + "/trades/301/close", 200, {"orderCancelTransaction": {"reason": "MARKET_HALTED"}}))
+        self.assertFalse(b.close_trade("301"))
+        b, _ = broker(("PUT", ACCT + "/trades/301/close", 200, {"orderFillTransaction": {"id": "9"}}))
+        self.assertTrue(b.close_trade("301"))
+
+    def test_orders_only_open_positions(self):
+        b, t = broker(("GET", ACCT + "/instruments", 200, EUR_INFO),
+                      ("POST", ACCT + "/orders", 201, {"orderCancelTransaction": {"reason": "X"}}))
+        b.market_order("EUR_USD", 1, "fxb-1", 0.001, 1.2)
+        self.assertEqual([c for c in t.calls if c[0] == "POST"][0][2]["order"]["positionFill"], "OPEN_ONLY")
+
+    def test_trade_already_closed_after_fill_is_unknown_not_unprotected(self):
+        b, _ = broker(
+            ("GET", ACCT + "/instruments", 200, EUR_INFO),
+            ("POST", ACCT + "/orders", 201, {"orderFillTransaction": {"tradeOpened": {"tradeID": "301", "units": "1"}}}),
+            ("GET", ACCT + "/trades/301", 200, {"trade": {"id": "301", "state": "CLOSED", "price": "1.1",
+                                                         "initialUnits": "1"}}))
+        self.assertEqual(b.market_order("EUR_USD", 1, "fxb-x", 0.001, 1.2).status, "unknown")
+
+    def test_cancel_uses_client_order_id_and_partial_close_is_reported(self):
+        page = {"transactions": [
+            {"id": "300", "type": "ORDER_CANCEL", "time": "2026-11-03T09:15:11Z", "orderID": "299",
+             "clientOrderID": "fxb-q", "reason": "BOUNDS_VIOLATION"},
+            {"id": "301", "type": "ORDER_FILL", "time": "2026-11-03T10:00:00Z", "instrument": "EUR_USD",
+             "tradesClosed": [{"tradeID": "101", "units": "-5", "price": "1.1017", "realizedPL": "-1.5"}]},
+            {"id": "302", "type": "ORDER_FILL", "time": "2026-11-03T10:05:00Z", "instrument": "EUR_USD",
+             "tradeReduced": {"tradeID": "102", "units": "-3", "price": "1.1", "realizedPL": "0.2"}}]}
+        b, _ = broker(("GET", ACCT + "/transactions/sinceid?id=299", 200, page),
+                      ("GET", ACCT + "/transactions/sinceid?id=302", 200, {"transactions": []}))
+        got = b.transactions_since(299)
+        self.assertEqual([(x.kind, x.client_id, x.trade_id) for x in got],
+                         [("REJECT", "fxb-q", None), ("CLOSE", None, "101"), ("REDUCE", None, "102")])
+        self.assertEqual(got[1].price, 1.1017)                  # no top-level price needed
+
+    def test_instrument_info_refreshed_daily(self):
+        now = [datetime(2026, 11, 3, tzinfo=UTC)]
+        b, t = broker(("GET", ACCT + "/instruments", 200, EUR_INFO), clock=lambda: now[0])
+        b.instrument("EUR_USD")
+        now[0] += timedelta(hours=25)
+        b.instrument("EUR_USD")
+        self.assertEqual(len(t.calls), 2)
 
 
 class TransactionTests(unittest.TestCase):
@@ -189,7 +278,7 @@ class WriteTests(unittest.TestCase):
         b, t = broker(("GET", ACCT + "/trades/301", 200, {"trade": {"id": "301", "instrument": "EUR_USD"}}),
                       ("GET", ACCT + "/instruments", 200, EUR_INFO),
                       ("PUT", ACCT + "/trades/301/orders", 200, {}),
-                      ("PUT", ACCT + "/trades/301/close", 200, {}),
+                      ("PUT", ACCT + "/trades/301/close", 200, {"orderFillTransaction": {"id": "9"}}),
                       ("PUT", ACCT + "/trades/999/close", 404, {"errorMessage": "not found"}))
         self.assertTrue(b.set_take_profit("301", 1.103123456))
         self.assertEqual([c for c in t.calls if c[0] == "PUT"][0][2]["takeProfit"]["price"], "1.10312")

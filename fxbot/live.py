@@ -1,11 +1,14 @@
 """Live scheduler for Railway (spec §5, §7): one process, a loop that wakes every second.
 
 - Trading cycle 10 s after each M15 close while the market is open; while candles are late
-  ("stale candles"), retried every 10 s for up to 60 s.
+  ("stale candles"), retried every 10 s for up to 60 s. A cycle more than 90 s after its close
+  (restart, slow step) still reconciles and protects but never enters: no catch-up trading.
 - Friday from 19:30 London, and after a confirmed /flatten: flatten every 60 s until flat.
 - Telegram commands every 10 s; healthcheck ping every 5 minutes, weekends included.
-- Any unexpected exception from a cycle halts new entries and alerts; the loop keeps running
-  so protection, commands and the healthcheck continue.
+- Any unexpected exception from a cycle or flatten halts new entries and alerts; failures in
+  Telegram, the healthcheck or notifications are only logged. Nothing stops the loop.
+- Alerts when new entries have been blocked for over an hour, and when Telegram commands
+  cannot be read for 5 minutes.
 """
 import os
 import time
@@ -14,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fxbot.alerts import Alerter, Healthcheck
+from fxbot.broker import is_bot
 from fxbot.config import Settings
 from fxbot.control import Control
 from fxbot.engine import Engine, weekend_phase
@@ -24,6 +28,9 @@ UTC = timezone.utc
 NEW_YORK = ZoneInfo("America/New_York")
 M15 = timedelta(minutes=15)
 DELAY = timedelta(seconds=10)
+ENTRY_DEADLINE = timedelta(seconds=90)      # later than this after a close: no new entries
+BLOCKED_ALERT_AFTER = timedelta(hours=1)
+TELEGRAM_FAILURES_ALERT = 30                # consecutive failed polls (about 5 minutes)
 
 
 class ConfigError(Exception):
@@ -53,8 +60,11 @@ def load_config(env=os.environ) -> LiveConfig:
         raise ConfigError(f"missing environment variables: {', '.join(missing)}")
     if bool(env.get("TELEGRAM_BOT_TOKEN")) != bool(env.get("TELEGRAM_CHAT_ID")):
         raise ConfigError("set both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or neither")
+    enabled = env.get("TRADING_ENABLED", "true").lower()
+    if enabled not in ("true", "false"):
+        raise ConfigError("TRADING_ENABLED must be 'true' or 'false'")
     return LiveConfig(env["OANDA_API_TOKEN"], env["OANDA_ACCOUNT_ID"], environment,
-                      env.get("DATA_DIR", "/data"), env.get("TRADING_ENABLED", "true").lower() != "false",
+                      env.get("DATA_DIR", "/data"), enabled == "true",
                       env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID"), env.get("HEALTHCHECK_URL"))
 
 
@@ -70,11 +80,11 @@ def market_open(now: datetime) -> bool:
     return True
 
 
-def status_text(ledger: Ledger) -> str:
+def status_text(ledger: Ledger, nav: float | None = None) -> str:
     lines = [f"Halted: {ledger.halt_reason()}" if ledger.halt_reason() else "Not halted",
              f"Paused: {ledger.pause_reason()}" if ledger.pause_reason() else "Not paused"]
     positions = ledger.open_positions()
-    lines.append(f"Open bot trades: {len(positions)}")
+    lines.append(f"Open bot trades: {len(positions)}; Open risk £{sum(p.risk_gbp or 0 for p in positions):.2f}")
     for p in positions:
         lines.append(f"  {p.pair} {'long' if p.side > 0 else 'short'} {p.units} @ {p.fill_price} "
                      f"stop {p.stop_price} target {p.tp_price} risk £{p.risk_gbp or 0:.2f}")
@@ -82,6 +92,9 @@ def status_text(ledger: Ledger) -> str:
     if snap:
         lines.append(f"Day {snap[0]}: start NAV £{snap[1]:.2f}"
                      + (" (daily loss limit reached)" if ledger.daily_loss_latched(snap[0]) else ""))
+        if nav is not None:
+            deposits, withdrawals = ledger.contributions_since(snap[2])
+            lines.append(f"NAV £{nav:.2f}; Day P&L £{nav - snap[1] - deposits + withdrawals:.2f}")
     return "\n".join(lines)
 
 
@@ -95,6 +108,9 @@ class LiveRunner:
         self.last_poll = self.last_ping = self.last_flatten = None
         self.reported_closed = {p.client_id for p in ledger.all_positions() if p.status == "closed"}
         self.summary_day = None
+        self.block_reason: str | None = None
+        self.block_since: datetime | None = None
+        self.telegram_failures = 0
 
     @staticmethod
     def _close_time(now: datetime) -> datetime:
@@ -106,11 +122,11 @@ class LiveRunner:
     def step(self, now: datetime) -> None:
         if self.control and self._every(self.last_poll, now, timedelta(seconds=10)):
             self.last_poll = now
-            self.control.poll(now)
+            self._safe(lambda: self._poll(now))
         if self.health and self._every(self.last_ping, now, timedelta(minutes=5)):
             self.last_ping = now
-            self.health.ping()
-        self._daily_summary(now)
+            self._safe(self.health.ping)
+        self._safe(lambda: self._daily_summary(now))
         if not market_open(now):
             return
         flatten_requested = self.ledger.get("flatten_requested") is not None
@@ -120,14 +136,16 @@ class LiveRunner:
             self._guard(lambda: self._flatten(now, flatten_requested), now)
         close = self._close_time(now)
         if now >= close + DELAY and self.done_close != close and (self.retry_at is None or now >= self.retry_at):
-            report = self._guard(lambda: self.engine.run_cycle(now), now)
+            on_time = now - close <= ENTRY_DEADLINE
+            report = self._guard(lambda: self.engine.run_cycle(now, allow_entries=on_time), now)
             late = report is not None and (report.blocked or "").startswith("stale candles")
             if late and now < close + DELAY + timedelta(seconds=60):
                 self.retry_at = now + timedelta(seconds=10)
             else:
                 self.done_close, self.retry_at = close, None
             if report is not None:
-                self._notify(report)
+                self._safe(lambda: self._notify(report))
+                self._watch_blocks(report.blocked, now)
         if self.broker is not None and getattr(self.broker, "auth_failed", False):
             if not self.ledger.halt_reason():
                 self.ledger.halt("halted: OANDA rejected the credentials")
@@ -145,11 +163,40 @@ class LiveRunner:
                               f"Open now: {len(self.ledger.open_positions())}.")
             self.summary_day = day
 
+    def _poll(self, now: datetime) -> None:
+        if self.control.poll(now) is False:
+            self.telegram_failures += 1
+            if self.telegram_failures >= TELEGRAM_FAILURES_ALERT:
+                self.alerter("warning", "Telegram commands are not being received (check the bot token "
+                             "and that no other program polls it); use the OANDA app if needed")
+        else:
+            self.telegram_failures = 0
+
+    def _watch_blocks(self, reason: str | None, now: datetime) -> None:
+        """Alert if new entries stay blocked for over an hour (a silent stop is the worst failure)."""
+        if not reason or reason.startswith(("paused by user", "late cycle")):
+            self.block_reason = self.block_since = None
+            return
+        if reason != self.block_reason:
+            self.block_reason, self.block_since = reason, now
+        elif now - self.block_since >= BLOCKED_ALERT_AFTER:
+            self.alerter("warning", f"No new trades for over an hour: {reason}")
+
     def _flatten(self, now: datetime, requested: bool) -> None:
         remaining = self.engine.flatten(now)
+        if remaining == 0 and self.broker is not None:   # trust the broker's list, not the replies
+            remaining = sum(1 for t in self.broker.open_trades() if is_bot(t.client_id))
         if requested and remaining == 0:
             self.ledger.set("flatten_requested", None)
             self.alerter.info("Flatten complete: no bot trades open.")
+
+    def _safe(self, action):
+        """For non-trading parts (Telegram, healthcheck, messages): log failures, never halt."""
+        try:
+            return action()
+        except Exception as exc:
+            self.alerter.log(f"{type(exc).__name__} in background task: {exc}")
+            return None
 
     def _guard(self, action, now: datetime):
         try:

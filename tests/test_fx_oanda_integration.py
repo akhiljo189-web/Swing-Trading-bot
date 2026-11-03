@@ -67,7 +67,11 @@ class PracticeAccountTests(unittest.TestCase):
             self.assertEqual(again.status, "rejected")
         finally:
             self.assertTrue(b.close_trade(result.trade_id))
+        bound_cid = cid[:-1] + "X"
+        far = b.market_order("EUR_USD", 1, bound_cid, 0.0050, ask - 0.0100)     # price bound cannot be met
+        self.assertEqual(far.status, "rejected")
         txns = b.transactions_since(start_txn)
+        self.assertIn(bound_cid, [t.client_id for t in txns if t.kind == "REJECT"])
         fills = [t for t in txns if t.kind == "FILL" and t.client_id == cid]
         closes = [t for t in txns if t.kind == "CLOSE" and t.trade_id == result.trade_id]
         self.assertEqual(len(fills), 1)
